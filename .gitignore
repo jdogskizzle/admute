@@ -1,0 +1,4 @@
+# Generated at runtime: learned logos, logs, replay results, test captures
+/data/
+__pycache__/
+*.pyc

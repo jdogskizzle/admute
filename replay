@@ -1,0 +1,27 @@
+#!/bin/sh
+# Run the replay tool (app/replay.py) in a throwaway copy of the admute container.
+#   ./replay survey path/to/recording.ts
+#   ./replay render path/to/recording.ts 1:20:00 10:00
+# Host paths are translated to container paths using the volumes in docker-compose.yaml,
+# so recordings must be inside one of the folders mounted there.
+here=$(dirname "$(realpath "$0")")
+mounts=$(docker compose --project-directory "$here" config --format json) || exit 1
+for a in "$@"; do
+  shift
+  if [ -e "$a" ]; then
+    a=$(printf '%s' "$mounts" | python3 -c '
+import json, os, sys
+path = os.path.realpath(sys.argv[1])
+vols = json.load(sys.stdin)["services"]["admute"].get("volumes", [])
+for v in sorted(vols, key=lambda v: -len(v.get("source", ""))):
+    src = os.path.realpath(v.get("source", ""))
+    if v.get("type") == "bind" and (path == src or path.startswith(src + "/")):
+        print(v["target"] + path[len(src):]); break
+else:
+    sys.exit(f"{path} is not inside any folder mounted in docker-compose.yaml")
+' "$a") || exit 1
+  fi
+  set -- "$@" "$a"
+done
+cd "$here" || exit 1
+exec docker compose run --rm --no-deps -T --entrypoint python3 admute -u /app/replay.py "$@"

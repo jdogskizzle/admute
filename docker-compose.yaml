@@ -1,0 +1,39 @@
+# admute: mutes ads on live TV from an HDHomeRun, as an M3U tuner for Jellyfin.
+# Everything specific to one machine lives in this file: the HDHomeRun address, the folders,
+# the user, the Docker network and the GPU. Change these to suit your setup.
+#
+# Jellyfin: add an M3U tuner with URL http://admute:5004/lineup.m3u (Jellyfin must be on
+# the same Docker network). See README.md for the replay tool and tuning settings.
+services:
+  admute:
+    build: .
+    image: admute:local
+    container_name: admute
+    restart: unless-stopped
+    user: "1000:1000"         # owner of the files written to ./data and the review folder
+    environment:
+      - HDHR_HOST=192.168.5.75
+      - CHANNELS=4.1          # comma list like 4.1,5.1, or "favorites" or "all"
+      - DELAY=6               # seconds viewers are behind live (lookahead for the detector)
+      - AD_MIN=3              # seconds without the logo before muting; keep about 3s under DELAY
+      - LINGER=15             # keep a channel open this long after the last viewer leaves
+      - DETECT_GPU=1          # 0 to decode on the CPU (and drop the deploy section below)
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+    volumes:
+      - ./app:/app:ro
+      - ./data:/data                              # learned logos, logs, replay results (not in git)
+      - /mnt/media/dvr:/recordings:ro             # recordings for ./replay
+      - /mnt/media/admute-review:/review          # ./replay render writes clips here
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]
+    networks:
+      - apps                  # the network Jellyfin is on
+
+networks:
+  apps:
+    external: true

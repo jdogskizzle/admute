@@ -1,7 +1,9 @@
-"""Ad-mute proxy for HDHomeRun live TV.
+"""Ad-mute proxy for live TV.
 
-Jellyfin uses this as an M3U tuner. Nothing runs until someone opens a channel. Then it
-pulls that channel from the HDHomeRun, holds it back by DELAY seconds, and starts an
+Reads channels from any tuner or IPTV source that publishes an M3U playlist of MPEG-TS
+streams (SOURCE_M3U), and serves its own playlist that Jellyfin uses as an M3U tuner.
+Nothing runs until someone opens a channel. Then it pulls that channel from the source,
+holds it back by DELAY seconds, and starts an
 ffmpeg that decodes it on the GPU for the ad detector. The detector sees everything
 DELAY seconds before the viewer does, so a mute can start right where the ad starts.
 When the last viewer leaves (after LINGER seconds), everything for that channel stops:
@@ -11,7 +13,9 @@ the tuner is released, ffmpeg exits and the GPU is free again.
 import asyncio
 import logging
 import os
+import re
 import time
+from urllib.parse import quote
 from pathlib import Path
 
 import aiohttp
@@ -21,10 +25,10 @@ from detect import AdDetector
 from pipeline import FFMPEG, DetectorProc, Pipeline
 from ts import SilentFrames
 
-HDHR = os.environ["HDHR_HOST"]                      # HDHomeRun address, set in docker-compose.yaml
+SOURCE = os.environ["SOURCE_M3U"]                   # tuner's M3U playlist (URL or file), set in docker-compose.yaml
 PORT = int(os.environ.get("PORT", "5004"))
 PUBLIC_URL = os.environ.get("PUBLIC_URL", f"http://admute:{PORT}").rstrip("/")
-CHANNELS = os.environ.get("CHANNELS", "favorites")  # comma list like 4.1,5.1, "favorites" or "all"
+CHANNELS = os.environ.get("CHANNELS", "all")       # comma list like 4.1,5.1, "group:<name>" or "all"
 NAME_SUFFIX = os.environ.get("NAME_SUFFIX", " (ad-mute)")
 DELAY = float(os.environ.get("DELAY", "10"))       # seconds the viewer is behind live
 LINGER = float(os.environ.get("LINGER", "15"))     # keep a channel open this long after the last viewer
@@ -39,21 +43,54 @@ class TunerError(Exception):
     pass
 
 
+_EXTINF = re.compile(r'#EXTINF:\s*-?\d+((?:\s+[\w-]+="[^"]*")*)\s*,(.*)')
+_ATTR = re.compile(r'([\w-]+)="([^"]*)"')
+
+
+def parse_m3u(text):
+    """Channels from an M3U playlist: number, name, stream URL, guide id, logo and group."""
+    chans, info = [], None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXTINF"):
+            m = _EXTINF.match(line)
+            info = (dict(_ATTR.findall(m.group(1))), m.group(2).strip()) if m else ({}, "")
+        elif line and not line.startswith("#") and info is not None:
+            attrs, title = info
+            num = (attrs.get("tvg-chno") or attrs.get("channel-number") or attrs.get("tvg-id")
+                   or attrs.get("channel-id") or str(len(chans) + 1))
+            chans.append({
+                "num": num,
+                "name": attrs.get("tvg-name") or title or num,
+                "url": line,
+                "id": attrs.get("tvg-id") or attrs.get("channel-id") or num,
+                "logo": attrs.get("tvg-logo", ""),
+                "group": attrs.get("group-title", ""),
+            })
+            info = None
+    return chans
+
+
 _lineup = {"at": 0.0, "data": []}
 
 
 async def lineup(http):
     if not _lineup["data"] or time.monotonic() - _lineup["at"] > 600:
-        async with http.get(f"http://{HDHR}/lineup.json", timeout=aiohttp.ClientTimeout(total=10)) as r:
-            _lineup["data"] = await r.json(content_type=None)
+        if "://" in SOURCE:
+            async with http.get(SOURCE, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                r.raise_for_status()
+                text = await r.text()
+        else:
+            text = Path(SOURCE).read_text()
+        _lineup["data"] = parse_m3u(text)
         _lineup["at"] = time.monotonic()
     data = _lineup["data"]
     if CHANNELS == "all":
         return data
-    if CHANNELS == "favorites":
-        return [c for c in data if c.get("Favorite")]
+    if CHANNELS.startswith("group:"):
+        return [c for c in data if c["group"] == CHANNELS[6:]]
     wanted = {c.strip() for c in CHANNELS.split(",")}
-    return [c for c in data if c["GuideNumber"] in wanted]
+    return [c for c in data if c["num"] in wanted]
 
 
 class Session:
@@ -61,7 +98,7 @@ class Session:
 
     def __init__(self, app, chan):
         self.app = app
-        self.num, self.name, self.url = chan["GuideNumber"], chan["GuideName"], chan["URL"]
+        self.num, self.name, self.url = chan["num"], chan["name"], chan["url"]
         self.clients = set()
         self.pipe = Pipeline(self.num, app["silent"])
         self.proc = None
@@ -110,6 +147,9 @@ class Session:
 
     async def _run_detector(self):
         await asyncio.sleep(DETECT_AFTER)
+        if not self.pipe.demux.audio:
+            log.warning("%s: no AC-3 audio track found; ads on this channel can't be muted "
+                        "(only AC-3 audio, as used by US broadcast TV, is supported so far)", self.num)
         self.pipe.detector = AdDetector(self.num, self.name, DATA)
         gpu = DETECT_GPU
         while True:
@@ -180,10 +220,11 @@ class Session:
 async def m3u(request):
     lines = ["#EXTM3U"]
     for c in await lineup(request.app["http"]):
-        num, name = c["GuideNumber"], c["GuideName"]
-        lines.append(f'#EXTINF:-1 tvg-id="{num}" tvg-chno="{num}" tvg-name="{name}" '
+        num, name = c["num"], c["name"]
+        logo = f' tvg-logo="{c["logo"]}"' if c["logo"] else ""
+        lines.append(f'#EXTINF:-1 tvg-id="{c["id"]}" tvg-chno="{num}" tvg-name="{name}"{logo} '
                      f'group-title="Ad-mute",{name}{NAME_SUFFIX}')
-        lines.append(f"{PUBLIC_URL}/stream/{num}")
+        lines.append(f"{PUBLIC_URL}/stream/{quote(num, safe='')}")
     return web.Response(text="\n".join(lines) + "\n", content_type="audio/x-mpegurl")
 
 
@@ -195,14 +236,14 @@ async def stream(request):
     async with app["lock"]:
         sess = app["sessions"].get(num)
         if not sess:
-            chans = {c["GuideNumber"]: c for c in await lineup(app["http"])}
+            chans = {c["num"]: c for c in await lineup(app["http"])}
             if num not in chans:
                 raise web.HTTPNotFound(text=f"channel {num} isn't enabled\n")
             sess = Session(app, chans[num])
             try:
                 await sess.open()
             except TunerError as exc:
-                log.warning("%s: HDHomeRun refused the stream (HTTP %s), probably no free tuner", num, exc)
+                log.warning("%s: the source refused the stream (HTTP %s), probably no free tuner", num, exc)
                 raise web.HTTPServiceUnavailable(text="no free tuner\n")
             app["sessions"][num] = sess
     q = asyncio.Queue()

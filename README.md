@@ -1,20 +1,27 @@
 # admute
 
-Mutes ads on live TV from the HDHomeRun. Jellyfin uses it as an M3U tuner.
+Mutes ads on live TV. It sits between a tuner and Jellyfin: it reads the tuner's M3U
+playlist and serves its own, which Jellyfin uses as an M3U tuner.
+
+Works with any tuner or IPTV source that publishes an M3U playlist of MPEG-TS streams
+(HDHomeRun, Tvheadend, Threadfin and others). Muting currently needs AC-3 audio, which is
+what US over-the-air broadcasts use; other audio formats pass through unmuted.
 
 - Idle: nothing runs except a tiny web server (no tuner, no GPU).
-- When a channel is opened: pulls it from the HDHomeRun, delays it by `DELAY` seconds,
+- When a channel is opened: pulls it from the tuner, delays it by `DELAY` seconds,
   and runs a GPU-decoding ffmpeg so the detector can look ahead and mute the ad from its start.
 - Muting swaps the AC-3 audio frames for silent ones. No re-encoding; video is untouched.
 - `LINGER` seconds after the last viewer leaves, the tuner and GPU are released.
 
 ## Setup
-All machine-specific settings are in `docker-compose.yaml`: HDHomeRun address, channels,
+All machine-specific settings are in `docker-compose.yaml`: the tuner's playlist (`SOURCE_M3U`,
+a URL or a file; for an HDHomeRun it's `http://<ip>/lineup.m3u`), channels,
 folders, user ID, the Docker network Jellyfin is on, and the GPU. Then `docker compose up -d --build`.
 
 ## Setup in Jellyfin
 Dashboard > Live TV > Tuner Devices > Add > **M3U Tuner**, URL `http://admute:5004/lineup.m3u`.
-Channel IDs match the hdhr-guide XMLTV guide, so the guide lines up automatically.
+Guide IDs (`tvg-id`, or `channel-id`, else the channel number) are passed through from the
+source playlist, so an XMLTV guide that matches the tuner also matches these channels.
 
 ## How detection works
 The station logo. The detector learns where each channel's logo is (edges that stay put in one

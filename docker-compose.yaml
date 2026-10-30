@@ -1,5 +1,5 @@
-# admute: mutes ads on live TV from an HDHomeRun, as an M3U tuner for Jellyfin.
-# Everything specific to one machine lives in this file: the HDHomeRun address, the folders,
+# admute: mutes ads on live TV, as an M3U tuner for Jellyfin.
+# Everything specific to one machine lives in this file: the tuner's playlist, the folders,
 # the user, the Docker network and the GPU. Change these to suit your setup.
 #
 # Jellyfin: add an M3U tuner with URL http://admute:5004/lineup.m3u (Jellyfin must be on
@@ -12,8 +12,8 @@ services:
     restart: unless-stopped
     user: "1000:1000"         # owner of the files written to ./data and the review folder
     environment:
-      - HDHR_HOST=192.168.5.75
-      - CHANNELS=4.1          # comma list like 4.1,5.1, or "favorites" or "all"
+      - SOURCE_M3U=http://192.168.5.75/lineup.m3u   # tuner's M3U playlist (HDHomeRun: http://<ip>/lineup.m3u)
+      - CHANNELS=4.1          # comma list like 4.1,5.1, "group:<group-title>" or "all"
       - DELAY=6               # seconds viewers are behind live (lookahead for the detector)
       - AD_MIN=3              # seconds without the logo before muting; keep about 3s under DELAY
       - LINGER=15             # keep a channel open this long after the last viewer leaves

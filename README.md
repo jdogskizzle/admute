@@ -24,10 +24,15 @@ Guide IDs (`tvg-id`, or `channel-id`, else the channel number) are passed throug
 source playlist, so an XMLTV guide that matches the tuner also matches these channels.
 
 ## How detection works
-The station logo. The detector learns where each channel's logo is (edges that stay put in one
-corner over many minutes), which takes about 5 minutes of watching a channel the first time.
-After that it's saved in `data/logos/<channel>.npz` and reused. An ad is "logo gone for
-`AD_MIN` seconds"; it ends when the logo is back for `SHOW_MIN` seconds. Black frames and
+On-screen graphics: the station logo, and in sports the scorebug. The detector learns where
+they are (edges that stay put in a corner over many minutes; up to two graphics in different
+corners), which takes about 5 minutes of watching a channel the first time. It then learns a
+picture of each one and recognises it by shape, which still works for a see-through logo over
+a bright background. It's saved in `data/logos/<channel>.npz` and reused.
+
+It's a show while any graphic is on screen. An ad is "all graphics gone for `AD_MIN` seconds";
+it ends when one is back for `SHOW_MIN` seconds. Following two graphics matters for sports:
+replays and close-ups usually drop the scorebug but keep the station logo. Black frames and
 silence nudge the start and end to the actual cut.
 
 ## Files
@@ -44,8 +49,8 @@ docker logs -f admute
 (`curl` may not be in the image; use `python3 -c "import urllib.request as u;print(u.urlopen('http://localhost:5004/status').read().decode())"`.)
 
 ## Tuning (environment in docker-compose.yaml)
-`CHANNELS`, `DELAY`, `LINGER`, `LOGO_ON` / `LOGO_OFF` (fractions of the channel's usual logo score,
-default 0.85 / 0.75), `MERGE` (seconds; ads closer than this count as one break), `AD_MIN`, `SHOW_MIN`,
+`CHANNELS`, `DELAY`, `LINGER`, `LOGO_ON` / `LOGO_OFF` (shape match of a graphic, 0 to 1, above which
+it counts as on screen / below which it's gone; default 0.35 / 0.3), `GRAPHICS` (how many to follow, default 2), `MERGE` (seconds; ads closer than this count as one break), `AD_MIN`, `SHOW_MIN`,
 `AD_MAX` (unmute if the "ad" lasts this long, e.g. a show with no logo; default 300),
 `ARM` (seconds the logo must be on screen before muting is armed), `LEARN_MIN` (minutes).
 

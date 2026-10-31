@@ -154,7 +154,7 @@ def sheets(path, out):
     hw = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"] if GPU else []
     scale = "scale_cuda=256:144,hwdownload,format=nv12" if GPU else "scale=256:144"
     vf = (f"setpts=PTS-STARTPTS,fps=1/10,{scale},"
-          "drawtext=text='%{pts\\:hms}':x=4:y=4:fontsize=16:fontcolor=white:box=1:boxcolor=black@0.6,"
+          "drawtext=text='%{pts\\:hms}':x=4:y=h-th-6:fontsize=16:fontcolor=white:box=1:boxcolor=black@0.6,"
           "tile=6x10")
     return subprocess.Popen([FFMPEG, "-hide_banner", "-loglevel", "error", *hw, "-i", str(path),
                              "-vf", vf, "-q:v", "4", str(out / "sheet_%03d.jpg")])
@@ -213,7 +213,7 @@ async def survey(args):
     timeline(work / "timeline.csv", work / "timeline.png")
     breaks = [(s, e) for s, e in det.intervals]
     lines = [f"{path.name}", f"length {hms(det.last_t or 0)}, surveyed in {took / 60:.1f} min",
-             f"logo: {det.corner or 'not found'}, usual score {det.level:.2f}", "",
+             f"graphics: {det._describe() or 'not found'}", "",
              f"{len(breaks)} breaks muted:"]
     for s, e in breaks:
         end = e if e != float("inf") else (det.last_t or s)

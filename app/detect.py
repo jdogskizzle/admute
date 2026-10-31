@@ -1,10 +1,13 @@
 """Ad detection from the decoded picture and sound.
 
-The main signal is the station logo. Most stations keep a logo in one corner during shows
-and drop it during ads. The detector learns where the logo is by finding edges that stay
-put over many minutes, saves that per channel, and calls it an ad once the logo has been
-gone for a few seconds. Black frames and silence, which usually mark the cut into and out
-of a break, are used to place the start and end of the mute.
+The main signal is the on-screen graphics. Most stations keep a logo in one corner during
+shows and drop it during ads, and sports add a scorebug. The detector learns where these
+are by finding edges that stay put over many minutes (up to two graphics, in different
+corners), saves that per channel, and calls it an ad once all of them have been gone for a
+few seconds. Each graphic is recognised by matching its shape against a learned picture of
+it, which still works when it is see-through and the background is bright (a translucent
+bug over ice). Black frames and silence, which usually mark the cut into and out of a
+break, are used to place the start and end of the mute.
 """
 
 import csv
@@ -32,10 +35,14 @@ EDGE = _env("EDGE", 24)                        # brightness step that counts as 
 MASK_T = _env("MASK_T", 0.6)                   # share of frames a pixel must be an edge to count as logo
 LEARN_MIN = _env("LEARN_MIN", 5) * 60 * FPS    # minutes of video before the logo is trusted
 LEARN_TAU = _env("LEARN_TAU", 15) * 60 * FPS   # how slowly the learned logo changes
-# Thresholds are fractions of the channel's usual logo score (often about 0.95). Ad graphics
-# that happen to sit in the logo corner (QR codes, end cards) scored up to about 0.66.
-LOGO_ON = _env("LOGO_ON", 0.85)                # above this share of the usual score: logo is on screen
-LOGO_OFF = _env("LOGO_OFF", 0.75)              # below this share: logo is gone
+# Shape match of a graphic against its learned picture, 0..1. On a hockey game, play scored
+# mostly 0.5-1 (even replays over bright ice) and ads mostly under 0.05.
+LOGO_ON = _env("LOGO_ON", 0.35)                # above this: the graphic is on screen
+LOGO_OFF = _env("LOGO_OFF", 0.3)               # below this: it's gone
+# Until a graphic's picture is learned, edge scores are used: fractions of its usual score.
+EDGE_ON, EDGE_OFF = 0.85, 0.75
+GRAPHICS = int(_env("GRAPHICS", 2))            # how many graphics (corners) to follow
+PICTURE_MIN = 30 * FPS                         # frames of a graphic needed before its picture is used
 MERGE = _env("MERGE", 15)                      # an ad starting this soon after one ended continues the break
 AD_MIN = _env("AD_MIN", 4)                     # seconds without the logo before muting
 SHOW_MIN = _env("SHOW_MIN", 3)                 # seconds with the logo back before unmuting
@@ -68,6 +75,55 @@ def write_png(path, img):
     os.replace(tmp, path)
 
 
+def highpass(p):
+    """Picture minus its 3x3 blur: keeps the outline of a graphic, drops the background."""
+    h, w = p.shape
+    pad = np.pad(p, 1, mode="edge")
+    return p - sum(pad[i:i + h, j:j + w] for i in range(3) for j in range(3)) / 9
+
+
+def normalize(p):
+    return (p - p.mean()) / (p.std() + 1e-3)
+
+
+class Graphic:
+    """One steady on-screen graphic (station logo or scorebug) in one corner."""
+
+    def __init__(self, corner, mask, box, picture=None, n=0, level=0.95):
+        self.corner, self.mask, self.box = corner, mask, box
+        self.picture = np.zeros((box[1] - box[0], box[3] - box[2]), np.float32) if picture is None else picture
+        self.n, self.level = n, level
+        self.edge = self.shape = None
+
+    def measure(self, g, edges, learn):
+        """Score this frame; `learn` lets a clearly visible graphic refine its picture."""
+        self.edge = float(edges[self.mask].mean())
+        y0, y1, x0, x1 = self.box
+        hp = highpass(g[y0:y1, x0:x1].astype(np.float32))
+        if learn and self.edge >= 0.8 * self.level:
+            self.n += 1
+            self.picture += max(1.0 / self.n, 1.0 / LEARN_TAU) * (hp - self.picture)
+        if self.edge >= EDGE_ON * self.level:
+            self.level = min(1.0, max(0.3, self.level + (self.edge - self.level) / (60 * FPS)))
+        if self.n >= PICTURE_MIN:
+            # A see-through graphic can show up darker than a bright background, so the
+            # match can come out negative; either way it's there.
+            self.shape = abs(float((normalize(hp) * normalize(self.picture)).mean()))
+        else:
+            self.shape = None
+
+    def state(self):
+        """True (on screen), False (gone) or None (in between)."""
+        if self.shape is not None:
+            v, on, off = self.shape, LOGO_ON, LOGO_OFF
+        else:
+            v, on, off = self.edge / self.level, EDGE_ON, EDGE_OFF
+        return True if v >= on else False if v <= off else None
+
+    def score(self):
+        return self.shape if self.shape is not None else min(1.0, self.edge / self.level)
+
+
 def wall(t):
     """Monotonic time -> wall clock string."""
     return time.strftime("%H:%M:%S", time.localtime(time.time() - (time.monotonic() - t)))
@@ -90,17 +146,25 @@ class AdDetector:
 
         self.freq = np.zeros((H - 1, W - 1), np.float32)  # how often each pixel is an edge
         self.seen = 0
-        self.level = 0.95  # the channel's usual logo score while the logo is on screen
+        self.graphics = []  # Graphic per followed corner, biggest first
         if self.state_path.exists():
             try:
                 with np.load(self.state_path) as d:
                     self.freq, self.seen = d["freq"].astype(np.float32), int(d["seen"])
-                    if "level" in d:
-                        self.level = float(d["level"])
+                    for i in range(GRAPHICS):
+                        if f"g{i}_corner" in d:
+                            corner = str(d[f"g{i}_corner"])
+                            ys, xs = CORNERS[corner]
+                            mask = np.zeros(self.freq.shape, bool)
+                            self.graphics.append(Graphic(corner, mask, tuple(int(v) for v in d[f"g{i}_box"]),
+                                                         d[f"g{i}_picture"].astype(np.float32),
+                                                         int(d[f"g{i}_n"]), float(d[f"g{i}_level"])))
+                    if not self.graphics and "level" in d:  # saved by an older version: one graphic
+                        self._old_level = float(d["level"])
             except Exception as exc:
                 log.warning("%s: couldn't load saved logo (%s), learning again", num, exc)
-        self.mask, self.corner = None, None
-        self._update_mask()
+                self.graphics = []
+        self._update_graphics()
 
         self.score = None
         self.logo, self.changed_at = True, None
@@ -117,8 +181,8 @@ class AdDetector:
         self._sec, self._scores, self._black, self._silent, self._rows = None, [], False, False, 0
         self._last_save = time.monotonic()
 
-        if self.mask is not None:
-            log.info("%s: using saved logo in the %s corner (%d px)", num, self.corner, self.mask.sum())
+        if self.graphics:
+            log.info("%s: using saved graphics: %s", num, self._describe())
         else:
             left = max(0, LEARN_MIN - self.seen) / FPS / 60
             log.info("%s: learning the logo, about %.0f more minutes of video needed", num, left)
@@ -136,15 +200,20 @@ class AdDetector:
         if not black and self.state != "ad":
             self.seen += 1
             self.freq += max(1.0 / self.seen, 1.0 / LEARN_TAU) * (edges - self.freq)
-            if self.mask is None or self.seen % (FPS * 30) == 0:
-                had = self.mask is not None
-                self._update_mask()
-                if self.mask is not None and not had:
-                    log.info("%s: logo learned in the %s corner (%d px), ad muting is on",
-                             self.num, self.corner, self.mask.sum())
+            if not self.graphics or self.seen % (FPS * 30) == 0:
+                had = [x.corner for x in self.graphics]
+                self._update_graphics()
+                now_ = [x.corner for x in self.graphics]
+                if now_ != had and now_:
+                    log.info("%s: following %s%s", self.num, self._describe(),
+                             ", ad muting is on" if not had else "")
+                elif now_ != had:
+                    log.info("%s: lost the on-screen graphics, learning them again", self.num)
                     self.save()
 
-        self.score = float(edges[self.mask].mean()) if self.mask is not None else None
+        for x in self.graphics:
+            x.measure(g, edges, learn=not black and self.state != "ad")
+        self.score = max((x.score() for x in self.graphics), default=None)
         self._decide(t)
         self._log_second(t, black)
         if time.monotonic() - self._last_save > 120:
@@ -163,11 +232,29 @@ class AdDetector:
 
     # --- logic --------------------------------------------------------------
 
-    def _update_mask(self):
+    @property
+    def mask(self):
+        """All followed graphics together (for the preview picture and status)."""
+        if not self.graphics:
+            return None
+        m = np.zeros(self.freq.shape, bool)
+        for x in self.graphics:
+            m |= x.mask
+        return m
+
+    @property
+    def corner(self):
+        return " + ".join(x.corner for x in self.graphics) or None
+
+    def _describe(self):
+        return ", ".join(f"{x.corner} ({x.mask.sum()} px{'' if x.n >= PICTURE_MIN else ', picture not learned yet'})"
+                         for x in self.graphics)
+
+    def _update_graphics(self):
         if self.seen < LEARN_MIN:
-            self.mask = None
-            return
-        best, best_n = None, 0
+            if not self.graphics:
+                return
+        found = []
         for name, (ys, xs) in CORNERS.items():
             sub = self.freq[ys, xs] > MASK_T
             # Long straight lines are letterbox/pillarbox edges or tickers, not a logo.
@@ -175,24 +262,35 @@ class AdDetector:
             sub[:, cols] = False
             sub[rows, :] = False
             n = int(sub.sum())
-            if n > best_n:
-                best, best_n = (name, ys, xs, sub), n
-        if best_n < 80:  # smaller than this is usually a bit of static scenery, not a logo
-            self.mask = None
-            return
-        name, ys, xs, sub = best
-        mask = np.zeros(self.freq.shape, bool)
-        mask[ys, xs] = sub
-        self.mask, self.corner = mask, name
+            if n >= 80:  # smaller than this is usually a bit of static scenery, not a logo
+                mask = np.zeros(self.freq.shape, bool)
+                mask[ys, xs] = sub
+                found.append((n, name, mask))
+        found.sort(key=lambda f: -f[0])
+        old = {x.corner: x for x in self.graphics}
+        keep = []
+        for n, name, mask in found[:GRAPHICS]:
+            yy, xx = np.nonzero(mask)
+            ys, xs = CORNERS[name]
+            box = (max(ys.start, int(yy.min()) - 3), min(ys.stop, int(yy.max()) + 4),
+                   max(xs.start, int(xx.min()) - 3), min(xs.stop, int(xx.max()) + 4))
+            x = old.get(name)
+            if x and x.box[0] <= box[0] and x.box[1] >= box[1] and x.box[2] <= box[2] and x.box[3] >= box[3]:
+                x.mask = mask  # same graphic: keep its learned picture
+            else:
+                if x:  # it grew past its box: learn the picture again for the bigger box
+                    box = (min(box[0], x.box[0]), max(box[1], x.box[1]), min(box[2], x.box[2]), max(box[3], x.box[3]))
+                x = Graphic(name, mask, box, level=getattr(self, "_old_level", 0.95))
+            keep.append(x)
+        if keep or self.seen >= LEARN_MIN:
+            self.graphics = keep
 
     def _decide(self, t):
-        s = self.score
-        if s is None:
+        if not self.graphics:
             return
-        on, off = LOGO_ON * self.level, LOGO_OFF * self.level
-        logo = True if s >= on else False if s <= off else self.logo
-        if logo and s >= on:  # follow slow drift in how strongly the logo shows up
-            self.level = min(1.0, max(0.3, self.level + (s - self.level) / (60 * FPS)))
+        # On screen while any graphic is clearly there; gone once all of them clearly are.
+        states = [x.state() for x in self.graphics]
+        logo = True if True in states else False if all(v is False for v in states) else self.logo
         if logo != self.logo or self.changed_at is None:
             self.logo, self.changed_at = logo, t
         held = t - self.changed_at
@@ -263,7 +361,11 @@ class AdDetector:
         self._last_save = time.monotonic()
         tmp = self.state_path.with_name(f"{self.num}.tmp.npz")
         with open(tmp, "wb") as f:
-            np.savez_compressed(f, freq=self.freq, seen=self.seen, level=self.level)
+            extra = {}
+            for i, x in enumerate(self.graphics):
+                extra.update({f"g{i}_corner": x.corner, f"g{i}_box": np.array(x.box), f"g{i}_picture": x.picture,
+                              f"g{i}_n": x.n, f"g{i}_level": x.level})
+            np.savez_compressed(f, freq=self.freq, seen=self.seen, **extra)
         os.replace(tmp, self.state_path)
         img = np.clip(self.freq * 160, 0, 160).astype(np.uint8)
         if self.mask is not None:
@@ -278,11 +380,12 @@ class AdDetector:
 
     def status(self):
         return {
-            "logo_learned": self.mask is not None,
-            "logo_corner": self.corner,
+            "logo_learned": bool(self.graphics),
             "learning_minutes_left": round(max(0, LEARN_MIN - self.seen) / FPS / 60, 1),
             "logo_score": None if self.score is None else round(self.score, 3),
-            "logo_usual_score": round(self.level, 3),
+            "graphics": [{"corner": x.corner, "pixels": int(x.mask.sum()),
+                          "picture_learned": x.n >= PICTURE_MIN,
+                          "score": None if x.edge is None else round(x.score(), 3)} for x in self.graphics],
             "state": self.state,
             "armed": self.armed,
             "ads_muted": self.ads,

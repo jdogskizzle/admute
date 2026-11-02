@@ -49,7 +49,8 @@ TUNABLE = {
     "LOGO_ON": (0.05, 0.9, 0.01), "LOGO_OFF": (0.02, 0.8, 0.01), "AD_MIN": (1, 10, 0.5),
     "SHOW_MIN": (1, 10, 0.5), "MERGE": (0, 60, 1), "ARM": (0, 60, 1), "SNAP": (0, 6, 0.5),
     "SURFACE": (0, 1, 1), "SURFACE_AT": (0.1, 0.9, 0.05), "SURFACE_HOLD": (0, 5, 0.5),
-    "SPLICE": (-1, 1, 1), "SPLICE_WAIT": (5, 60, 1), "AD_MAX": (60, 600, 10),
+    "SPLICE": (-1, 1, 1), "SPLICE_WAIT": (5, 60, 1), "LAYOUT": (0, 1, 1), "LAYOUT_HOLD": (0, 3, 0.2),
+    "AD_MAX": (60, 600, 10),
 }
 
 
@@ -108,7 +109,8 @@ def trace(name):
     hit = _traces.get(name)
     if not hit or hit[0] != mtime:
         with np.load(path) as d:
-            hit = (mtime, {"frames": d["frames"], "silences": d["silences"]})
+            hit = (mtime, {k: d[k] for k in ("frames", "silences", "splice", "layouts", "layout_names",
+                                             "layout_thresholds") if k in d})
         _traces[name] = hit
     return hit[1]
 
@@ -146,17 +148,26 @@ def timeline(name):
     s = tr["silences"].astype(np.int64)
     s = s[(s >= 0) & (s < n)]
     sil[s] = 1
-    return {"length": n, "graphics": graphics, "surface": mean(2), "surface_show": mean(3),
+    lays = []
+    if "layouts" in tr and tr["layouts"].size:
+        for i, nm in enumerate(tr["layout_names"]):
+            lays.append({"name": str(nm), "threshold": float(tr["layout_thresholds"][i]),
+                         "score": mean(tr["layouts"][:, i])})
+    return {"length": n, "graphics": graphics, "layouts": lays, "surface": mean(2), "surface_show": mean(3),
             "surface_ad": mean(4), "surface_learned": any_(5), "black": any_(1), "silent": sil.tolist()}
 
 
 def merged(spans):
+    """Sorted labels with overlaps joined. A label is [start, end] or [start, end, "sbs"]
+    (a side-by-side ad, which the layout learning uses)."""
     out = []
-    for s, e in sorted(spans):
-        if out and s <= out[-1][1]:
-            out[-1][1] = max(out[-1][1], e)
+    for a in sorted(spans):
+        if out and a[0] <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], a[1])
+            if len(a) > 2 and len(out[-1]) == 2:
+                out[-1].append(a[2])
         else:
-            out.append([s, e])
+            out.append(list(a))
     return out
 
 
@@ -166,6 +177,7 @@ def score(breaks, ads, length):
     muted, truth = np.zeros(n, bool), np.zeros(n, bool)
     for s, e in breaks:
         muted[max(0, int(round(s))):max(0, int(round(e)))] = True
+    ads = [a[:2] for a in ads]
     for s, e in ads:
         truth[max(0, int(round(s))):max(0, int(round(e)))] = True
     false_mutes = [[s, e] for s, e in breaks if truth[int(round(s)):int(round(e))].mean() < 0.5]
@@ -214,6 +226,15 @@ def score_all(settings):
     return rows
 
 
+def layouts():
+    out = []
+    for f in sorted((REPLAY.parent / "layouts").glob("*.npz")):
+        with np.load(f) as d:
+            out.append({"name": f.stem, "threshold": float(d["threshold"]), "pixels": int(d["mask"].sum()),
+                        "examples": [str(x) for x in d["examples"]], "modified": f.stat().st_mtime})
+    return out
+
+
 # --- jobs ------------------------------------------------------------------------
 
 class Jobs:
@@ -224,14 +245,18 @@ class Jobs:
         (STATE / "jobs").mkdir(parents=True, exist_ok=True)
 
     def start(self, kind, name, **kw):
-        path = find(name)
-        if path is None:
+        path = None if kind == "layouts" else find(name)
+        if path is None and kind != "layouts":
             raise ValueError("no such recording")
+        if kind == "layouts" and any(j["kind"] == "layouts" and j["state"] == "running" for j in self.jobs):
+            raise ValueError("already learning layouts")
         if kind == "survey":
             if self.active_for(name):
                 raise ValueError("a job is already running for this recording")
             args = ["survey", str(path)] + (["--fresh"] if kw.get("fresh") else [])
             what = "Survey" + (" (learn again)" if kw.get("fresh") else "")
+        elif kind == "layouts":
+            args, what = ["layouts"], "Learn side-by-side layouts"
         elif kind == "render":
             start, length = float(kw["start"]), float(kw.get("length", 600))
             if not 0 <= start or not 10 <= length <= 3600:
@@ -249,7 +274,7 @@ class Jobs:
                 raise ValueError(f"{MAX_JOBS} jobs are already running; wait for one to finish")
             self.n += 1
             job = {"id": f"{int(time.time())}-{self.n}", "kind": kind, "name": name, "what": what,
-                   "title": path.stem, "state": "running", "started": time.time(), "ended": None}
+                   "title": path.stem if path else "all labelled recordings", "state": "running", "started": time.time(), "ended": None}
             log = STATE / "jobs" / f"{job['id']}.log"
             job["log"] = str(log)
             proc = subprocess.Popen([sys.executable, "-u", str(REPLAY_PY), *args], stdout=open(log, "wb"),
@@ -394,6 +419,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, JOBS.list())
         if path == "/api/live":
             return self.send(200, live())
+        if path == "/api/layouts":
+            return self.send(200, layouts())
+        m = re.fullmatch(r"/api/layouts/(layout-\d+)\.png", path)
+        if m and (REPLAY.parent / "layouts" / f"{m.group(1)}.png").exists():
+            return self.send(200, (REPLAY.parent / "layouts" / f"{m.group(1)}.png").read_bytes(), "image/png")
         if path == "/api/score-all":
             return self.send(200, score_all(settings_from(q)))
         m = re.fullmatch(r"/api/rec/([\w.-]+)(?:/(\w+))?(?:/(\d+)\.jpg)?", path)
@@ -468,7 +498,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {"stopped": JOBS.stop(str(req.get("id")))})
             m = re.fullmatch(r"/api/rec/([\w.-]+)/labels", path)
             if m and find(m.group(1)) is not None:
-                ads = merged([[float(s), float(e)] for s, e in req.get("ads", []) if float(e) > float(s) >= 0])
+                ads = merged([[float(a[0]), float(a[1])] + (["sbs"] if len(a) > 2 and a[2] == "sbs" else [])
+                              for a in req.get("ads", []) if float(a[1]) > float(a[0]) >= 0])
                 labels = {"ads": ads, "reviewed": bool(req.get("reviewed")), "notes": str(req.get("notes", ""))[:5000],
                           "updated": time.time()}
                 f = REPLAY / m.group(1) / "labels.json"

@@ -18,6 +18,7 @@ import struct
 import time
 import zlib
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 
@@ -61,7 +62,11 @@ SURFACE_HOLD = _env("SURFACE_HOLD", 2)         # ...and it must stay on screen t
 # with a mark (learned), a lost logo only mutes from a mark, or after SPLICE_WAIT seconds.
 SPLICE = _env("SPLICE", -1)                    # -1 learn per channel, 0 off, 1 always
 SPLICE_WAIT = _env("SPLICE_WAIT", 20)
-SETTINGS = dict(LOGO_ON=LOGO_ON, LOGO_OFF=LOGO_OFF, AD_MIN=AD_MIN, SHOW_MIN=SHOW_MIN, MERGE=MERGE,
+# Side-by-side ads: the network's fixed frame around a small game picture and the ad,
+# learned from labelled examples (replay.py layouts) into DATA/layouts, shared by all channels.
+LAYOUT = _env("LAYOUT", 1)                     # 0 ignores the learned layouts
+LAYOUT_HOLD = _env("LAYOUT_HOLD", 0.6)         # seconds a layout must match before muting
+SETTINGS = dict(LAYOUT=LAYOUT, LAYOUT_HOLD=LAYOUT_HOLD, LOGO_ON=LOGO_ON, LOGO_OFF=LOGO_OFF, AD_MIN=AD_MIN, SHOW_MIN=SHOW_MIN, MERGE=MERGE,
                 AD_MAX=AD_MAX, ARM=ARM, SNAP=SNAP, SURFACE=SURFACE, SURFACE_AT=SURFACE_AT,
                 SURFACE_HOLD=SURFACE_HOLD, SPLICE=SPLICE, SPLICE_WAIT=SPLICE_WAIT)
 SPLICE_BREAK = 60      # mutes at least this long count as real breaks when learning about marks
@@ -100,6 +105,34 @@ def highpass(p):
 
 def normalize(p):
     return (p - p.mean()) / (p.std() + 1e-3)
+
+
+def edge_map(g):
+    """Pixels with a sharp brightness step to the right or below (g: int16 picture)."""
+    return (np.abs(g[:-1, 1:] - g[:-1, :-1]) + np.abs(g[1:, :-1] - g[:-1, :-1])) > EDGE
+
+
+class Layout:
+    """A side-by-side ad frame: edges that are there in every example of it. Its score is the
+    share of them lit in a frame, relative to the examples; above `threshold` it's on screen."""
+
+    def __init__(self, name, mask, level, threshold):
+        self.name, self.mask, self.level, self.threshold = name, mask, level, threshold
+
+    def score(self, edges):
+        return float(edges[self.mask].mean()) / self.level
+
+    @staticmethod
+    def load_all():
+        folder = Path(os.environ.get("DATA", "/data")) / "layouts"
+        out = []
+        for f in sorted(folder.glob("*.npz")):
+            try:
+                with np.load(f) as d:
+                    out.append(Layout(f.stem, d["mask"].astype(bool), float(d["level"]), float(d["threshold"])))
+            except Exception as exc:
+                log.warning("couldn't load layout %s: %s", f.name, exc)
+        return out
 
 
 class Graphic:
@@ -217,6 +250,7 @@ class Decider:
         self.surface_since = None
         self.splice = list(splice)  # [breaks seen, breaks that started with a mark]
         self.loss_marked = None  # whether the break being muted started at a black frame or silence
+        self.layout_since = None  # when a side-by-side ad layout came on screen
         # Not armed until the logo has actually been seen, so a show without it isn't muted.
         self.state, self.armed = "show", False
         self.intervals = []  # [start, end] mute ranges, in stream arrival time
@@ -224,9 +258,18 @@ class Decider:
         self.blacks = deque(maxlen=300)
         self.silences = deque(maxlen=600)
 
-    def step(self, t, states, surface=False):
-        """states: on/gone/None per graphic for this frame; surface: playing surface on screen."""
+    def step(self, t, states, surface=False, layout=False):
+        """states: on/gone/None per graphic for this frame; surface: playing surface on screen;
+        layout: a learned side-by-side ad layout matches this frame."""
         p = self.p
+        if layout and p["LAYOUT"]:
+            if self.layout_since is None:
+                self.layout_since = t
+        else:
+            self.layout_since = None
+        sbs = self.layout_since is not None and t - self.layout_since >= p["LAYOUT_HOLD"]
+        if sbs:  # a side-by-side ad: whatever graphics the small game picture shows don't count
+            states = [False] * max(1, len(states))
         if surface:
             if self.surface_since is None:
                 self.surface_since = t
@@ -247,10 +290,12 @@ class Decider:
                 if not self.armed and held >= p["ARM"]:
                     self.armed = True
                     self.event(f"logo on screen since {self.fmt(self.changed_at)}, ad muting armed")
-            elif self.armed and t - max(self.changed_at, self.surface_at or 0) >= p["AD_MIN"]:
-                gone = max(self.changed_at, self.surface_at or 0)
+            elif sbs or (self.armed and t - max(self.changed_at, self.surface_at or 0) >= p["AD_MIN"]):
+                gone = self.layout_since if sbs else max(self.changed_at, self.surface_at or 0)
                 start = self._snap(gone)
-                if self.splice_needed():
+                if sbs:
+                    start = max(start, t - (_env("DELAY", 10) - 1))
+                elif self.splice_needed():
                     marks = self._marks(gone - p["SNAP"], t)
                     if marks:  # mute from the cut (or a later one, after a station promo)
                         near = [m for m in marks if m <= gone + 0.5]
@@ -323,7 +368,9 @@ def replay_trace(trace, p):
     d = Decider(p, keep=None, splice=tuple(trace["splice"]) if "splice" in trace else (0, 0))
     f, sil, si = trace["frames"], trace["silences"], 0
     ng = (f.shape[1] - 6) // 2
-    for row in f.tolist():
+    lay = trace.get("layouts")
+    sbs = (lay >= trace["layout_thresholds"]).any(axis=1) if lay is not None and lay.size else np.zeros(len(f), bool)
+    for k, row in enumerate(f.tolist()):
         t = row[0]
         while si < len(sil) and sil[si] <= t:
             d.silences.append(float(sil[si]))
@@ -333,7 +380,7 @@ def replay_trace(trace, p):
         states = [graphic_state(None if math.isnan(row[6 + 2 * i]) else row[6 + 2 * i], row[7 + 2 * i], p)
                   for i in range(ng) if not math.isnan(row[7 + 2 * i])]
         th = surface_threshold(bool(row[5]), row[3], row[4], p)
-        d.step(t, states, th is not None and row[2] >= th)
+        d.step(t, states, th is not None and row[2] >= th, bool(sbs[k]))
     end = f[-1, 0] if len(f) else 0.0
     return [(s, float(end) if e == math.inf else e) for s, e in d.intervals]
 
@@ -390,7 +437,10 @@ class AdDetector:
         self.score = None
         self._splice = getattr(self, "_splice", (0, 0))
         self.decider = Decider(SETTINGS, self.fmt, lambda: self.now(), self._event, keep, self._splice)
-        self.trace = ([], []) if trace else None  # (frame rows, silence times)
+        self.trace = ([], [], []) if trace else None  # (frame rows, silence times, layout scores)
+        self.layouts = Layout.load_all()
+        if self.layouts:
+            log.info("%s: watching for %d side-by-side ad layout%s", num, len(self.layouts), "s" * (len(self.layouts) > 1))
 
         self._csv_file = open(logdir / f"{time.strftime('%Y%m%d-%H%M%S')}.csv", "w", newline="")
         self._csv = csv.writer(self._csv_file)
@@ -412,7 +462,9 @@ class AdDetector:
         black = np.count_nonzero(g > 40) < g.size * 0.01
         if black:
             self.decider.blacks.append(t)
-        edges = (np.abs(g[:-1, 1:] - g[:-1, :-1]) + np.abs(g[1:, :-1] - g[:-1, :-1])) > EDGE
+        edges = edge_map(g)
+        lay = [x.score(edges) for x in self.layouts]
+        sbs = any(v >= x.threshold for v, x in zip(lay, self.layouts))
 
         if not black and self.state != "ad":
             self.seen += 1
@@ -436,7 +488,7 @@ class AdDetector:
             inside = self.state == "ad" and self.intervals and t - self.intervals[-1][0] > 10
             sf.measure(img, uv, show=self.logo and self.state == "show", ad=inside)
             share = sf.share
-        self.decider.step(t, [x.state() for x in self.graphics], share >= (sf.threshold() or 2))
+        self.decider.step(t, [x.state() for x in self.graphics], share >= (sf.threshold() or 2), sbs)
         if self.trace is not None:
             row = [t, float(black), share, sf.show, sf.ad, float(sf.learned())]
             for i in range(GRAPHICS):
@@ -444,6 +496,7 @@ class AdDetector:
                 row += [math.nan, math.nan] if x is None or x.edge is None else \
                        [math.nan if x.shape is None else x.shape, x.edge / x.level]
             self.trace[0].append(row)
+            self.trace[2].append(lay)
         self._log_second(t, black)
         if time.monotonic() - self._last_save > 120:
             self.save()
@@ -462,8 +515,11 @@ class AdDetector:
         return any(s <= t < e for s, e in self.intervals)
 
     def save_trace(self, path):
-        rows, sil = self.trace
+        rows, sil, lay = self.trace
         np.savez_compressed(path, frames=np.array(rows, np.float32).reshape(-1, len(TRACE_COLS)),
+                            layouts=np.array(lay, np.float32).reshape(len(rows), len(self.layouts)),
+                            layout_names=np.array([x.name for x in self.layouts]),
+                            layout_thresholds=np.array([x.threshold for x in self.layouts], np.float32),
                             silences=np.array(sorted(sil), np.float64), cols=np.array(TRACE_COLS),
                             splice=np.array(self._splice))
 

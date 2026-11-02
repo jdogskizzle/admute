@@ -70,7 +70,20 @@ setInterval(jobBadge, 5000); jobBadge();
 // ---------- recordings ----------
 let META = null; // defaults + tunable ranges
 async function listView() {
-  main.innerHTML = `<h1>Recordings</h1><div class="sub">Survey a recording to see what would be muted, then open it to check, label and tune.</div><div class="card" id="list"><div class="empty">Loading…</div></div>`;
+  main.innerHTML = `<h1>Recordings</h1><div class="sub">Survey a recording to see what would be muted, then open it to check, label and tune.</div><div class="card" id="list"><div class="empty">Loading…</div></div>
+    <h2 style="margin-top:22px">Side-by-side ad layouts</h2><div class="card" id="layouts"><div class="empty">Loading…</div></div>`;
+  const drawLayouts = async () => {
+    const ls = await api("api/layouts");
+    $("#layouts").innerHTML = `<p class="dim" style="margin-top:0">Learned from labels tagged SbS on any recording, and checked against everything else in the labelled recordings so they don't fire on the game. Used on every channel. Survey again after learning to see them in use.</p>
+      ${ls.length ? `<div class="cards">${ls.map(l => `<div><img class="logo" src="api/layouts/${l.name}.png?${l.modified}" alt="learned layout edges">
+        <div style="font-size:12px;margin-top:4px"><b>${esc(l.name)}</b> · ${l.examples.length} example${l.examples.length > 1 ? "s" : ""} · matches above ${l.threshold.toFixed(2)}</div></div>`).join("")}</div>` : `<div class="dim">None learned yet.</div>`}
+      <div class="row"><button data-learn>Learn layouts from labels</button></div>`;
+  };
+  $("#layouts").addEventListener("click", async e => {
+    if (!e.target.closest("[data-learn]")) return;
+    try { await api("api/jobs", { json: { kind: "layouts" } }); toast("Learning layouts; see Jobs"); } catch (err) { toast(err.message); }
+  });
+  drawLayouts();
   const draw = async () => {
     const d = await api("api/recordings"); META = d;
     const rows = d.recordings.map(r => {
@@ -208,8 +221,8 @@ async function recView(name) {
   loop();
 
   // --- timeline ---
-  const LANES = { g: [18, 120], surf: [146, 46], ev: [200, 16], lab: [224, 14], sur: [242, 14], tun: [260, 14], axis: [280, 18] };
-  const HEIGHT = 300;
+  const LANES = { g: [18, 120], surf: [146, 46], lay: [208, 26], ev: [240, 16], lab: [264, 14], sur: [282, 14], tun: [300, 14], axis: [320, 18] };
+  const HEIGHT = 340;
   const X = t => (t - R.view[0]) / (R.view[1] - R.view[0]) * canvas.clientWidth;
   const T = x => R.view[0] + x / canvas.clientWidth * (R.view[1] - R.view[0]);
 
@@ -234,7 +247,7 @@ async function recView(name) {
 
     // lane backgrounds and names
     const lane = (key, label) => { const [y, h] = LANES[key]; g.fillStyle = css("--panel2"); g.fillRect(0, y, W, h); g.fillStyle = dim; if (label) g.fillText(label, 6, y - 4); };
-    lane("g", "graphics (shape match)"); lane("surf", "playing surface share"); lane("ev");
+    lane("g", "graphics (shape match)"); lane("surf", "playing surface share"); lane("lay", "side-by-side layout match"); lane("ev");
     lane("lab"); lane("sur"); lane("tun");
     const nameAt = [];  // lane names, drawn last on a backing so bars don't hide them
     g.fillStyle = dim;
@@ -255,7 +268,8 @@ async function recView(name) {
       g.globalAlpha = 1;
     };
     shade(R.labels.ads, css("--label"));
-    spans(R.labels.ads, "lab", css("--label"));
+    spans(R.labels.ads.filter(a => a[2] !== "sbs"), "lab", css("--label"));
+    g.globalAlpha = 0.55; spans(R.labels.ads.filter(a => a[2] === "sbs"), "lab", css("--label")); g.globalAlpha = 1;
     spans(R.survey, "sur", css("--survey"));
     spans(R.sim?.breaks, "tun", css("--tuned"));
     if (R.sel >= 0 && R.labels.ads[R.sel]) {
@@ -311,6 +325,13 @@ async function recView(name) {
         if (pen) g.lineTo(x, y); else { g.moveTo(x, y); pen = true; }
       }
       g.stroke(); g.setLineDash([]);
+      // side-by-side layouts: best match, scaled so 1.0 = like the examples
+      const ll = LANES.lay;
+      (tl.layouts || []).forEach(L => { series(L.score, css("--tuned"), ll, 1.1); });
+      if ((tl.layouts || []).length) {
+        const th = Math.min(...tl.layouts.map(L => L.threshold)), y = ll[0] + ll[1] - th / 1.1 * ll[1];
+        g.strokeStyle = dim; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke(); g.setLineDash([]);
+      }
       // black frames / silence
       const ev = LANES.ev;
       const ticks = (arr, color, y, h) => {
@@ -419,7 +440,8 @@ async function recView(name) {
     if (tl && i >= 0 && i < tl.length) {
       const f = v => v == null ? "–" : v.toFixed(2);
       vals = (tl.graphics || []).map((gr, k) => `g${k + 1} ${f(gr.score[i])}`).join("  ") + `  surface ${f(tl.surface[i])}` +
-        (surfThreshold(i) != null ? `/${surfThreshold(i).toFixed(2)}` : "");
+        (surfThreshold(i) != null ? `/${surfThreshold(i).toFixed(2)}` : "") +
+        (tl.layouts || []).map(L => `  ${L.name} ${f(L.score[i])}/${L.threshold.toFixed(2)}`).join("");
     }
     const hasSheets = R.d.result;
     tip.innerHTML = (hasSheets ? `<div class="thumb" style="background-image:url('api/rec/${encodeURIComponent(name)}/sheet/${sheet}.jpg');background-position:${(tile % 6) * 20}% ${Math.floor(tile / 6) * 100 / 9}%"></div>` : "") +
@@ -531,11 +553,11 @@ async function recView(name) {
     const ads = R.labels.ads;
     let html = `<div class="row"><button class="primary" data-act="add-label">Add ad at playhead</button>
       ${!ads.length && R.survey.length ? `<button data-act="copy-labels">Start from survey mutes</button>` : ""}</div>
-      <p class="dim" style="margin:4px 0 10px;font-size:12px">Mark where each ad break really starts and ends. Select a row, then press <span class="kbd">I</span> / <span class="kbd">O</span> while watching to set its start / end to the playhead. Shift+drag on the timeline adds one.</p>`;
+      <p class="dim" style="margin:4px 0 10px;font-size:12px">Mark where each ad break really starts and ends. Tag side-by-side ads (game in a small box next to the ad) with <b>SbS</b>; the Recordings page learns their layout from these. Select a row, then press <span class="kbd">I</span> / <span class="kbd">O</span> while watching to set its start / end to the playhead. Shift+drag on the timeline adds one.</p>`;
     html += ads.length ? `<table><tbody>${ads.map(([s, e], i) => `<tr class="label-row ${i === R.sel ? "sel" : ""}" data-label="${i}">
       <td><input type="text" data-edit="${i},0" value="${hms(s)}"></td><td><input type="text" data-edit="${i},1" value="${hms(e)}"></td>
       <td class="num">${dur(e - s)}</td>
-      <td style="white-space:nowrap"><button data-play="${i}" title="play from just before">▶</button> <button data-del="${i}" title="delete">✕</button></td></tr>`).join("")}</tbody></table>`
+      <td style="white-space:nowrap"><button data-sbs="${i}" class="${ads[i][2] === "sbs" ? "primary" : ""}" title="side-by-side ad: used to learn what these look like">SbS</button> <button data-play="${i}" title="play from just before">▶</button> <button data-del="${i}" title="delete">✕</button></td></tr>`).join("")}</tbody></table>`
       : `<div class="empty">No labels yet.</div>`;
     html += `<div class="row" style="margin-top:12px"><label><input type="checkbox" data-act="reviewed" ${R.labels.reviewed ? "checked" : ""}> Reviewed: count this recording when scoring settings</label></div>
       <textarea data-act="notes" rows="3" style="width:100%" placeholder="Notes (e.g. 1:43:04 promo over crowd shot)">${esc(R.labels.notes || "")}</textarea>`;
@@ -564,6 +586,7 @@ async function recView(name) {
       SNAP: "Look this far back for a black frame or silence.", SURFACE: "1 = playing surface on screen holds off a mute.",
       SURFACE_AT: "Where the surface threshold sits between ads (0) and game (1).", AD_MAX: "Give up on a mute this long.",
       SURFACE_HOLD: "Seconds the surface must stay on screen to count.",
+      LAYOUT: "1 = a learned side-by-side ad layout mutes right away.", LAYOUT_HOLD: "Seconds a layout must match first.",
       SPLICE: "Wait for a black frame or silence before muting: -1 learn per channel, 0 never, 1 always.",
       SPLICE_WAIT: "When waiting for one: mute anyway after this many seconds without graphics.",
     };
@@ -612,11 +635,16 @@ async function recView(name) {
 
   const panel = $("#panel");
   panel.addEventListener("click", async e => {
-    const el = e.target.closest("[data-act],[data-seek],[data-del],[data-play],[data-label]");
+    const el = e.target.closest("[data-act],[data-seek],[data-del],[data-play],[data-sbs],[data-label]");
     if (!el) return;
     if (el.dataset.seek !== undefined) {
       const [s, en] = el.dataset.zoom.split(",").map(Number);
       zoomTo(s - 60, en + 60); seek(Number(el.dataset.seek)); return;
+    }
+    if (el.dataset.sbs !== undefined) {
+      const a = R.labels.ads[Number(el.dataset.sbs)];
+      if (a[2] === "sbs") a.length = 2; else a[2] = "sbs";
+      labelsChanged(); return;
     }
     if (el.dataset.del !== undefined) { R.labels.ads.splice(Number(el.dataset.del), 1); R.sel = -1; labelsChanged(); return; }
     if (el.dataset.play !== undefined) { const [s, en] = R.labels.ads[Number(el.dataset.play)]; R.sel = Number(el.dataset.play); zoomTo(s - 60, en + 60); seek(s - 5); renderPanel(); return; }

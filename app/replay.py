@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from detect import SETTINGS, AdDetector, write_png
+from detect import H, MASK_T, SETTINGS, W, AdDetector, edge_map, write_png
 from pipeline import FFMPEG, DetectorProc, Pipeline
 from ts import PKT, SilentFrames
 
@@ -234,6 +234,132 @@ async def survey(args):
     print("\n" + "\n".join(lines), flush=True)
 
 
+# --- side-by-side ad layouts ---------------------------------------------------
+
+LAYOUTS = DATA.parent / "layouts"
+
+
+def frames_lo(path, start, length, fps):
+    """Pictures at the detector's size (brightness only), decoded on the CPU."""
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-ss", f"{max(0, start):.2f}", "-i", str(path)]
+    if length:
+        cmd += ["-t", f"{length:.2f}"]
+    cmd += ["-map", "0:v:0", "-vf", f"fps={fps},scale={2 * W}:{2 * H}:flags=area,format=gray",
+            "-f", "rawvideo", "pipe:1"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    size, n = 4 * W * H, 0
+    try:
+        while len(buf := p.stdout.read(size)) == size:
+            hi = np.frombuffer(buf, np.uint8).reshape(2 * H, 2 * W)
+            yield start + n / fps, hi.reshape(H, 2, W, 2).mean(axis=(1, 3)).astype(np.int16)
+            n += 1
+    finally:
+        p.kill()
+        p.wait()
+
+
+def labelled():
+    """(name, recording path, labels) for every survey with labels."""
+    for d in sorted(DATA.iterdir()):
+        try:
+            labels = json.loads((d / "labels.json").read_text())
+            rec = json.loads((d / "result.json").read_text())["recording"]
+        except (OSError, ValueError, KeyError):
+            continue
+        if Path(rec).exists():
+            yield d.name, Path(rec), labels
+
+
+def learn_layouts(args):
+    """Learn side-by-side ad layouts from labels marked "sbs", and check each one against
+    everything else in the labelled recordings so it won't fire on the game."""
+    from concurrent.futures import ThreadPoolExecutor
+    recs = list(labelled())
+    examples = [(name, path, a[0], a[1]) for name, path, labels in recs
+                for a in labels.get("ads", []) if len(a) > 2 and a[2] == "sbs" and a[1] - a[0] >= 8]
+    if not examples:
+        sys.exit("No side-by-side ads labelled yet. Mark some in the studio (Labels tab), then run this again.")
+    print(f"Learning from {len(examples)} labelled side-by-side ads", flush=True)
+
+    def edges_of(ex):  # skip the first and last second: the frame animates in and out
+        name, path, s, e = ex
+        return [edge_map(g) for _, g in frames_lo(path, s + 1, e - s - 2, FPS_LEARN)]
+
+    with ThreadPoolExecutor(8) as pool:
+        ex_edges = list(pool.map(edges_of, examples))
+
+    # Group examples that share a frame, by how alike their average edges are.
+    groups = []
+    for ex, E in zip(examples, ex_edges):
+        if not E:
+            continue
+        m = np.mean(E, axis=0)
+        for g in groups:
+            if np.corrcoef(g["mean"].ravel(), m.ravel())[0, 1] > 0.5:
+                g["examples"].append(ex)
+                g["edges"] += E
+                g["mean"] = np.mean(g["edges"], axis=0)
+                break
+        else:
+            groups.append({"examples": [ex], "edges": list(E), "mean": m})
+
+    candidates = []
+    for g in groups:
+        mask = g["mean"] > MASK_T
+        if mask.sum() < 150:
+            print(f"  skipped a layout from {len(g['examples'])} example(s): too few steady edges", flush=True)
+            continue
+        pos = np.array([e[mask].mean() for e in g["edges"]])
+        candidates.append({**g, "mask": mask, "level": float(np.median(pos)), "pos": pos})
+    if not candidates:
+        sys.exit("No usable layouts found.")
+
+    # Everything that isn't a labelled side-by-side ad, one frame a second, must score lower.
+    def negatives(rec):
+        name, path, labels = rec
+        sbs = [(a[0] - 2, a[1] + 2) for a in labels.get("ads", []) if len(a) > 2 and a[2] == "sbs"]
+        out = []
+        for t, g in frames_lo(path, 0, None, 1):
+            if not any(s <= t <= e for s, e in sbs):
+                ed = edge_map(g)
+                out.append([ed[c["mask"]].mean() for c in candidates])
+        print(f"  checked {len(out)} other frames of {name}", flush=True)
+        return np.array(out).reshape(-1, len(candidates))
+
+    print(f"Checking {len(candidates)} layout(s) against the rest of {len(recs)} recordings "
+          "(a few minutes)", flush=True)
+    with ThreadPoolExecutor(len(recs)) as pool:
+        neg = np.concatenate(list(pool.map(negatives, recs)))
+
+    LAYOUTS.mkdir(parents=True, exist_ok=True)
+    for old in LAYOUTS.glob("*"):
+        old.unlink()
+    kept = 0
+    for i, c in enumerate(candidates):
+        lv = c["level"]
+        pos_lo = float(np.percentile(c["pos"], 10)) / lv
+        neg_hi = float(np.percentile(neg[:, i], 99.95)) / lv if len(neg) else 0.0
+        where = ", ".join(sorted({f"{n[:40]} {hms(s)}" for n, _, s, _ in c["examples"]}))
+        print(f"\nLayout {i + 1}: {len(c['examples'])} example(s): {where}\n  {int(c['mask'].sum())} edge pixels;"
+              f" examples score {pos_lo:.2f}+ (relative), everything else up to {neg_hi:.2f}", flush=True)
+        if pos_lo <= neg_hi + 0.1:
+            print("  not used: it doesn't stand apart from the rest of the broadcast", flush=True)
+            continue
+        th = (pos_lo + neg_hi) / 2
+        kept += 1
+        name = f"layout-{kept}"
+        np.savez_compressed(LAYOUTS / f"{name}.npz", mask=c["mask"], level=lv, threshold=th,
+                            examples=np.array([f"{n} {s:.1f}-{e:.1f}" for n, _, s, e in c["examples"]]))
+        img = (np.clip(c["mean"], 0, 1) * 140).astype(np.uint8)
+        img[c["mask"]] = 255
+        write_png(LAYOUTS / f"{name}.png", img)
+        print(f"  saved as {name}, matches above {th:.2f}", flush=True)
+    print(f"\n{kept} layout(s) saved. Survey again to see them in use.", flush=True)
+
+
+FPS_LEARN = 5
+
+
 # --- render -----------------------------------------------------------------
 
 async def render(args):
@@ -317,7 +443,10 @@ def main():
     r.add_argument("length", help="e.g. 10:00")
     r.add_argument("--name")
     r.add_argument("--warmup", type=float, default=30, help="seconds of detection before the clip starts")
+    sub.add_parser("layouts", help="learn side-by-side ad layouts from labelled examples")
     args = ap.parse_args()
+    if args.cmd == "layouts":
+        return learn_layouts(args)
     asyncio.run(survey(args) if args.cmd == "survey" else render(args))
 
 

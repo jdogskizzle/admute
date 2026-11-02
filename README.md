@@ -38,6 +38,13 @@ Some channels (CBS) cut to every break with a black frame and/or silence, while 
 stat graphics and studio cut-ins have none. The detector learns which channels do that, and on
 those it only mutes a lost logo from such a cut, or after `SPLICE_WAIT` seconds.
 
+Side-by-side ads (the game in a small box next to an ad, inside a fixed network frame such as
+CBS's "Eye on the field") are recognised by that frame. Tag some as SbS in the studio's labels
+and learn them (studio Recordings page, or `./replay layouts`): it learns each frame's steady
+edges, checks them against everything else in the labelled recordings so they don't fire on
+the game or the network's own boxed score updates, and saves them in `data/layouts/`. Every
+channel watches for them, and one on screen mutes right away.
+
 It's a show while any graphic is on screen. An ad is "all graphics gone for `AD_MIN` seconds";
 it ends when one is back for `SHOW_MIN` seconds. Following two graphics matters for sports:
 replays and close-ups usually drop the scorebug but keep the station logo. Black frames and
@@ -63,7 +70,8 @@ it counts as on screen / below which it's gone; default 0.35 / 0.3), `GRAPHICS` 
 `SURFACE` (0 turns off the playing-surface check), `SURFACE_AT` (where its threshold sits between
 the share usual in ads, 0, and in the show, 1; default 0.5), `SURFACE_HOLD` (seconds; default 2),
 `SPLICE` (wait for a black frame or silence before muting: -1 learn per channel, 0 never, 1 always),
-`SPLICE_WAIT` (mute anyway after this many seconds; default 20), `SNAP`,
+`SPLICE_WAIT` (mute anyway after this many seconds; default 20), `LAYOUT` (0 ignores learned
+side-by-side layouts), `LAYOUT_HOLD` (seconds a layout must match; default 0.6), `SNAP`,
 `ARM` (seconds the logo must be on screen before muting is armed), `LEARN_MIN` (minutes).
 
 ## Studio (dashboard)
@@ -97,6 +105,7 @@ detector only looks DELAY seconds ahead, like live, so results match what live T
 ```
 ./replay survey path/to/recording.ts                  # whole recording, ~20x real time
 ./replay render path/to/recording.ts 1:20:00 10:00    # a clip with muting applied
+./replay layouts                                      # learn side-by-side ad layouts from labels
 ```
 - survey writes to `data/replay/<name>/`: `breaks.txt` and `result.json` (what would be muted),
   `trace.npz` (per-frame scores, for tuning in the studio), `timeline.csv` (per second),

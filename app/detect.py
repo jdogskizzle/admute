@@ -52,6 +52,21 @@ ARM = _env("ARM", 20)                          # logo must be on screen this lon
 SNAP = _env("SNAP", 3)                         # look this far back for a black frame or silence
 SILENCE = 32768 * 10 ** (_env("SILENCE_DB", -50) / 20)
 
+# The settings the mute decisions use. A survey's trace can be replayed with other values
+# (see Decider), which is how the studio tries settings without decoding the video again.
+SURFACE_AT = _env("SURFACE_AT", 0.5)           # playing surface: where between "usual in ads" (0) and "usual in show" (1) it counts
+SURFACE_HOLD = _env("SURFACE_HOLD", 2)         # ...and it must stay on screen this long (ads flash colours too)
+# Splice marks: some channels cut to a break with a black frame and/or silence, and their
+# own graphics and studio cut-ins never have one. Where a channel's breaks reliably start
+# with a mark (learned), a lost logo only mutes from a mark, or after SPLICE_WAIT seconds.
+SPLICE = _env("SPLICE", -1)                    # -1 learn per channel, 0 off, 1 always
+SPLICE_WAIT = _env("SPLICE_WAIT", 20)
+SETTINGS = dict(LOGO_ON=LOGO_ON, LOGO_OFF=LOGO_OFF, AD_MIN=AD_MIN, SHOW_MIN=SHOW_MIN, MERGE=MERGE,
+                AD_MAX=AD_MAX, ARM=ARM, SNAP=SNAP, SURFACE=SURFACE, SURFACE_AT=SURFACE_AT,
+                SURFACE_HOLD=SURFACE_HOLD, SPLICE=SPLICE, SPLICE_WAIT=SPLICE_WAIT)
+SPLICE_BREAK = 60      # mutes at least this long count as real breaks when learning about marks
+SPLICE_SHARE = 0.75    # share of them that must start with a mark to rely on it
+
 _hh, _ww = int((H - 1) * 0.28), int((W - 1) * 0.28)
 CORNERS = {
     "top-left": (slice(0, _hh), slice(0, _ww)),
@@ -117,16 +132,22 @@ class Graphic:
         else:
             self.shape = None
 
-    def state(self):
+    def state(self, p=SETTINGS):
         """True (on screen), False (gone) or None (in between)."""
-        if self.shape is not None:
-            v, on, off = self.shape, LOGO_ON, LOGO_OFF
-        else:
-            v, on, off = self.edge / self.level, EDGE_ON, EDGE_OFF
-        return True if v >= on else False if v <= off else None
+        return graphic_state(self.shape, self.edge / self.level, p)
 
     def score(self):
         return self.shape if self.shape is not None else min(1.0, self.edge / self.level)
+
+
+def graphic_state(shape, edge, p):
+    """On screen (True), gone (False) or in between (None), from the shape match, or from
+    the edge score (relative to usual) while the graphic's picture isn't learned yet."""
+    if shape is not None:
+        v, on, off = shape, p["LOGO_ON"], p["LOGO_OFF"]
+    else:
+        v, on, off = edge, EDGE_ON, EDGE_OFF
+    return True if v >= on else False if v <= off else None
 
 
 class Surface:
@@ -164,17 +185,157 @@ class Surface:
             self.n_ad += 1
             self.ad += max(1.0 / self.n_ad, 1.0 / LEARN_TAU) * (self.share - self.ad)
 
-    def threshold(self):
-        """Share of the screen that counts as "the show is on", or None while it isn't useful."""
-        if not SURFACE or self.n_show < LEARN_MIN or self.n_ad < 60 * FPS:
-            return None
-        if self.show < 0.3 or self.show - self.ad < 0.25:  # not a clear difference on this channel
-            return None
-        return (self.show + self.ad) / 2
+    def learned(self):
+        return self.n_show >= LEARN_MIN and self.n_ad >= 60 * FPS
 
-    def visible(self):
-        th = self.threshold()
+    def threshold(self, p=SETTINGS):
+        """Share of the screen that counts as "the show is on", or None while it isn't useful."""
+        return surface_threshold(self.learned(), self.show, self.ad, p)
+
+    def visible(self, p=SETTINGS):
+        th = self.threshold(p)
         return th is not None and self.share >= th
+
+
+def surface_threshold(learned, show, ad, p):
+    if not p["SURFACE"] or not learned:
+        return None
+    if show < 0.3 or show - ad < 0.25:  # not a clear difference on this channel
+        return None
+    return ad + (show - ad) * p["SURFACE_AT"]
+
+
+class Decider:
+    """When to mute: all graphics gone for AD_MIN seconds (and the playing surface not on
+    screen), until one is back for SHOW_MIN seconds. Black frames and silence place the cut.
+    Kept apart from the picture analysis so a survey's trace can be replayed with other settings."""
+
+    def __init__(self, p=SETTINGS, fmt=str, now=time.monotonic, event=None, keep=10, splice=(0, 0)):
+        self.p, self.fmt, self.now, self.event, self.keep = p, fmt, now, event or (lambda m: None), keep
+        self.logo, self.changed_at = True, None
+        self.surface_at = None  # last time the playing surface was on screen (for SURFACE_HOLD)
+        self.surface_since = None
+        self.splice = list(splice)  # [breaks seen, breaks that started with a mark]
+        self.loss_marked = None  # whether the break being muted started at a black frame or silence
+        # Not armed until the logo has actually been seen, so a show without it isn't muted.
+        self.state, self.armed = "show", False
+        self.intervals = []  # [start, end] mute ranges, in stream arrival time
+        self.ads = 0
+        self.blacks = deque(maxlen=300)
+        self.silences = deque(maxlen=600)
+
+    def step(self, t, states, surface=False):
+        """states: on/gone/None per graphic for this frame; surface: playing surface on screen."""
+        p = self.p
+        if surface:
+            if self.surface_since is None:
+                self.surface_since = t
+            if t - self.surface_since >= p["SURFACE_HOLD"]:
+                self.surface_at = t
+        else:
+            self.surface_since = None
+        if not states:
+            return
+        # On screen while any graphic is clearly there; gone once all of them clearly are.
+        logo = True if True in states else False if all(v is False for v in states) else self.logo
+        if logo != self.logo or self.changed_at is None:
+            self.logo, self.changed_at = logo, t
+        held = t - self.changed_at
+
+        if self.state == "show":
+            if logo:
+                if not self.armed and held >= p["ARM"]:
+                    self.armed = True
+                    self.event(f"logo on screen since {self.fmt(self.changed_at)}, ad muting armed")
+            elif self.armed and t - max(self.changed_at, self.surface_at or 0) >= p["AD_MIN"]:
+                gone = max(self.changed_at, self.surface_at or 0)
+                start = self._snap(gone)
+                if self.splice_needed():
+                    marks = self._marks(gone - p["SNAP"], t)
+                    if marks:  # mute from the cut (or a later one, after a station promo)
+                        near = [m for m in marks if m <= gone + 0.5]
+                        start = max(near) if near else min(marks)
+                    elif t - gone >= p["SPLICE_WAIT"]:
+                        start = gone
+                    else:
+                        return  # no cut yet: probably the channel's own graphic or studio
+                    # what viewers haven't heard yet (DELAY behind, decoding about 1 s behind live)
+                    start = max(start, t - (_env("DELAY", 10) - 1))
+                self.loss_marked = bool(self._marks(gone - p["SNAP"], min(t, gone + 4)))
+                self.state = "ad"
+                prev = self.intervals[-1] if self.intervals else None
+                if prev and start - prev[1] <= p["MERGE"]:
+                    # Back-to-back ads with a logo-ish card between them: keep the break muted.
+                    gap = start - prev[1]
+                    prev[1] = math.inf
+                    self.event(f"next ad after a {gap:.0f}s gap, staying muted")
+                else:
+                    self.intervals.append([start, math.inf])
+                    if self.keep:
+                        self.intervals = self.intervals[-self.keep:]
+                    self.ads += 1
+                    # Viewers hear `start` at start + DELAY; positive margin means the mute was in time.
+                    margin = start + _env("DELAY", 10) - self.now()
+                    note = f"{margin:.1f}s to spare" if margin >= 0 else f"first {-margin:.1f}s of the ad was heard"
+                    self.event(f"ad start, muting from {self.fmt(start)} ({note})")
+        else:
+            cur = self.intervals[-1]
+            if logo and held >= p["SHOW_MIN"]:
+                cur[1] = max(cur[0], self._snap(self.changed_at))
+                self.state = "show"
+                if cur[1] - cur[0] >= SPLICE_BREAK and self.loss_marked is not None:
+                    self.splice[0] += 1
+                    self.splice[1] += self.loss_marked
+                    if self.splice[0] == 5 or self.splice[0] % 20 == 0:
+                        self.event(f"breaks starting at a black frame or silence: {self.splice[1]} of {self.splice[0]}"
+                                   + (", so other logo losses wait for one" if self.splice_needed() else ""))
+                self.event(f"ad end at {self.fmt(cur[1])}, muted {cur[1] - cur[0]:.0f}s")
+            elif t - cur[0] >= p["AD_MAX"]:
+                cur[1] = t
+                self.state, self.armed = "show", False
+                self.event(f"no logo for {p['AD_MAX']:.0f}s, probably a show without it; unmuted until the logo is back")
+
+    def splice_needed(self):
+        mode = self.p["SPLICE"]
+        if mode >= 0:
+            return bool(mode)
+        n, marked = self.splice
+        return n >= 5 and marked >= SPLICE_SHARE * n
+
+    def _marks(self, a, b):
+        return sorted(m for m in (*self.blacks, *self.silences) if a <= m <= b)
+
+    def _snap(self, t):
+        """Move a boundary to the nearest black frame or silence just before it, if there is one."""
+        marks = self._marks(t - self.p["SNAP"], t + 0.5)
+        return min(marks, key=lambda m: abs(m - t)) if marks else t
+
+
+# Per-frame trace a survey saves (trace.npz "frames"), one row per frame:
+TRACE_COLS = ["t", "black", "surface_share", "surface_show", "surface_ad", "surface_learned"] + \
+    [f"g{i}_{k}" for i in range(GRAPHICS) for k in ("shape", "edge")]
+
+
+def replay_trace(trace, p):
+    """Mute ranges a survey would have made with settings p, from its saved trace (fast:
+    no video). Learning isn't redone, so it's close to a full survey but not exact."""
+    p = {**SETTINGS, **p}
+    d = Decider(p, keep=None, splice=tuple(trace["splice"]) if "splice" in trace else (0, 0))
+    f, sil, si = trace["frames"], trace["silences"], 0
+    ng = (f.shape[1] - 6) // 2
+    for row in f.tolist():
+        t = row[0]
+        while si < len(sil) and sil[si] <= t:
+            d.silences.append(float(sil[si]))
+            si += 1
+        if row[1]:
+            d.blacks.append(t)
+        states = [graphic_state(None if math.isnan(row[6 + 2 * i]) else row[6 + 2 * i], row[7 + 2 * i], p)
+                  for i in range(ng) if not math.isnan(row[7 + 2 * i])]
+        th = surface_threshold(bool(row[5]), row[3], row[4], p)
+        d.step(t, states, th is not None and row[2] >= th)
+    end = f[-1, 0] if len(f) else 0.0
+    return [(s, float(end) if e == math.inf else e) for s, e in d.intervals]
 
 
 def wall(t):
@@ -183,9 +344,10 @@ def wall(t):
 
 
 class AdDetector:
-    def __init__(self, num, name, data_dir, fmt=None, now=None, keep=10):
+    def __init__(self, num, name, data_dir, fmt=None, now=None, keep=10, trace=False):
         """fmt turns a stream time into a readable label; now is the current time on the same
-        clock (live: arrival time; replay: how far the recording has been decoded)."""
+        clock (live: arrival time; replay: how far the recording has been decoded).
+        trace: keep per-frame scores (surveys save them for the studio to replay)."""
         self.num, self.name = num, name
         self.fmt, self.now, self.keep = fmt or wall, now or time.monotonic, keep
         self.last_t = None
@@ -216,6 +378,8 @@ class AdDetector:
                     if "surface_hist" in d:
                         self.surface = Surface(d["surface_hist"].astype(np.float32), float(d["surface_show"]),
                                                float(d["surface_ad"]), int(d["surface_n_show"]), int(d["surface_n_ad"]))
+                    if "splice" in d:
+                        self._splice = tuple(int(v) for v in d["splice"])
                     if not self.graphics and "level" in d:  # saved by an older version: one graphic
                         self._old_level = float(d["level"])
             except Exception as exc:
@@ -224,14 +388,9 @@ class AdDetector:
         self._update_graphics()
 
         self.score = None
-        self.logo, self.changed_at = True, None
-        self.surface_at = None  # last time the playing surface was on screen
-        # Not armed until the logo has actually been seen, so a show without it isn't muted.
-        self.state, self.armed = "show", False
-        self.intervals = []  # [start, end] mute ranges, in stream arrival time
-        self.ads = 0
-        self.blacks = deque(maxlen=300)
-        self.silences = deque(maxlen=600)
+        self._splice = getattr(self, "_splice", (0, 0))
+        self.decider = Decider(SETTINGS, self.fmt, lambda: self.now(), self._event, keep, self._splice)
+        self.trace = ([], []) if trace else None  # (frame rows, silence times)
 
         self._csv_file = open(logdir / f"{time.strftime('%Y%m%d-%H%M%S')}.csv", "w", newline="")
         self._csv = csv.writer(self._csv_file)
@@ -252,7 +411,7 @@ class AdDetector:
         g = img.astype(np.int16)
         black = np.count_nonzero(g > 40) < g.size * 0.01
         if black:
-            self.blacks.append(t)
+            self.decider.blacks.append(t)
         edges = (np.abs(g[:-1, 1:] - g[:-1, :-1]) + np.abs(g[1:, :-1] - g[:-1, :-1])) > EDGE
 
         if not black and self.state != "ad":
@@ -272,12 +431,19 @@ class AdDetector:
         for x in self.graphics:
             x.measure(g, edges, learn=not black and self.state != "ad", hi=hi)
         self.score = max((x.score() for x in self.graphics), default=None)
+        sf, share = self.surface, math.nan
         if uv is not None and not black and self.graphics:
             inside = self.state == "ad" and self.intervals and t - self.intervals[-1][0] > 10
-            self.surface.measure(img, uv, show=self.logo and self.state == "show", ad=inside)
-            if self.surface.visible():
-                self.surface_at = t
-        self._decide(t)
+            sf.measure(img, uv, show=self.logo and self.state == "show", ad=inside)
+            share = sf.share
+        self.decider.step(t, [x.state() for x in self.graphics], share >= (sf.threshold() or 2))
+        if self.trace is not None:
+            row = [t, float(black), share, sf.show, sf.ad, float(sf.learned())]
+            for i in range(GRAPHICS):
+                x = self.graphics[i] if i < len(self.graphics) else None
+                row += [math.nan, math.nan] if x is None or x.edge is None else \
+                       [math.nan if x.shape is None else x.shape, x.edge / x.level]
+            self.trace[0].append(row)
         self._log_second(t, black)
         if time.monotonic() - self._last_save > 120:
             self.save()
@@ -287,11 +453,26 @@ class AdDetector:
         for i in range(0, len(samples) - n + 1, n):
             w = samples[i:i + n].astype(np.float32)
             if math.sqrt(float(np.mean(w * w))) < SILENCE:
-                self.silences.append(t + i / AUDIO_RATE)
+                self.decider.silences.append(t + i / AUDIO_RATE)
+                if self.trace is not None:
+                    self.trace[1].append(t + i / AUDIO_RATE)
                 self._silent = True
 
     def muted(self, t):
         return any(s <= t < e for s, e in self.intervals)
+
+    def save_trace(self, path):
+        rows, sil = self.trace
+        np.savez_compressed(path, frames=np.array(rows, np.float32).reshape(-1, len(TRACE_COLS)),
+                            silences=np.array(sorted(sil), np.float64), cols=np.array(TRACE_COLS),
+                            splice=np.array(self._splice))
+
+    # The decisions live in self.decider; these are its current state.
+    intervals = property(lambda self: self.decider.intervals)
+    state = property(lambda self: self.decider.state)
+    logo = property(lambda self: self.decider.logo)
+    armed = property(lambda self: self.decider.armed)
+    ads = property(lambda self: self.decider.ads)
 
     # --- logic --------------------------------------------------------------
 
@@ -348,55 +529,6 @@ class AdDetector:
         if keep or self.seen >= LEARN_MIN:
             self.graphics = keep
 
-    def _decide(self, t):
-        if not self.graphics:
-            return
-        # On screen while any graphic is clearly there; gone once all of them clearly are.
-        states = [x.state() for x in self.graphics]
-        logo = True if True in states else False if all(v is False for v in states) else self.logo
-        if logo != self.logo or self.changed_at is None:
-            self.logo, self.changed_at = logo, t
-        held = t - self.changed_at
-
-        if self.state == "show":
-            if logo:
-                if not self.armed and held >= ARM:
-                    self.armed = True
-                    self._event(f"logo on screen since {self.fmt(self.changed_at)}, ad muting armed")
-            elif self.armed and t - max(self.changed_at, self.surface_at or 0) >= AD_MIN:
-                start = self._snap(max(self.changed_at, self.surface_at or 0))
-                self.state = "ad"
-                prev = self.intervals[-1] if self.intervals else None
-                if prev and start - prev[1] <= MERGE:
-                    # Back-to-back ads with a logo-ish card between them: keep the break muted.
-                    gap = start - prev[1]
-                    prev[1] = math.inf
-                    self._event(f"next ad after a {gap:.0f}s gap, staying muted")
-                else:
-                    self.intervals.append([start, math.inf])
-                    if self.keep:
-                        self.intervals = self.intervals[-self.keep:]
-                    self.ads += 1
-                    # Viewers hear `start` at start + DELAY; positive margin means the mute was in time.
-                    margin = start + _env("DELAY", 10) - self.now()
-                    note = f"{margin:.1f}s to spare" if margin >= 0 else f"first {-margin:.1f}s of the ad was heard"
-                    self._event(f"ad start, muting from {self.fmt(start)} ({note})")
-        else:
-            cur = self.intervals[-1]
-            if logo and held >= SHOW_MIN:
-                cur[1] = max(cur[0], self._snap(self.changed_at))
-                self.state = "show"
-                self._event(f"ad end at {self.fmt(cur[1])}, muted {cur[1] - cur[0]:.0f}s")
-            elif t - cur[0] >= AD_MAX:
-                cur[1] = t
-                self.state, self.armed = "show", False
-                self._event(f"no logo for {AD_MAX:.0f}s, probably a show without it; unmuted until the logo is back")
-
-    def _snap(self, t):
-        """Move a boundary to the nearest black frame or silence just before it, if there is one."""
-        marks = [m for m in (*self.blacks, *self.silences) if t - SNAP <= m <= t + 0.5]
-        return min(marks, key=lambda m: abs(m - t)) if marks else t
-
     # --- output -------------------------------------------------------------
 
     def _event(self, msg):
@@ -430,7 +562,8 @@ class AdDetector:
                               f"g{i}_n": x.n, f"g{i}_level": x.level})
             sf = self.surface
             np.savez_compressed(f, freq=self.freq, seen=self.seen, surface_hist=sf.hist, surface_show=sf.show,
-                                surface_ad=sf.ad, surface_n_show=sf.n_show, surface_n_ad=sf.n_ad, **extra)
+                                surface_ad=sf.ad, surface_n_show=sf.n_show, surface_n_ad=sf.n_ad,
+                                splice=np.array(self.decider.splice), **extra)
         os.replace(tmp, self.state_path)
         img = np.clip(self.freq * 160, 0, 160).astype(np.uint8)
         if self.mask is not None:

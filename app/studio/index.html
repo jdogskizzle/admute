@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>admute studio</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1' y='3' width='14' height='10' rx='2' fill='%23e0785c'/></svg>">
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+<header>
+  <a class="brand" href="#/"><span class="dot"></span>admute <b>studio</b></a>
+  <nav>
+    <a href="#/" data-nav="recordings">Recordings</a>
+    <a href="#/live" data-nav="live">Live</a>
+    <a href="#/jobs" data-nav="jobs">Jobs <span id="jobcount" class="pill" hidden></span></a>
+  </nav>
+  <form method="post" action="logout"><button class="ghost">Sign out</button></form>
+</header>
+<main id="main"></main>
+<div id="toast" hidden></div>
+<script src="static/app.js"></script>
+</body>
+</html>

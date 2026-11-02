@@ -52,7 +52,33 @@ docker logs -f admute
 `CHANNELS`, `DELAY`, `LINGER`, `LOGO_ON` / `LOGO_OFF` (shape match of a graphic, 0 to 1, above which
 it counts as on screen / below which it's gone; default 0.35 / 0.3), `GRAPHICS` (how many to follow, default 2), `MERGE` (seconds; ads closer than this count as one break), `AD_MIN`, `SHOW_MIN`,
 `AD_MAX` (unmute if the "ad" lasts this long, e.g. a show with no logo; default 300),
+`SURFACE` (0 turns off the playing-surface check), `SURFACE_AT` (where its threshold sits between
+the share usual in ads, 0, and in the show, 1; default 0.5), `SNAP`,
 `ARM` (seconds the logo must be on screen before muting is armed), `LEARN_MIN` (minutes).
+
+## Studio (dashboard)
+The `studio` service is a web dashboard for checking and tuning the detector on recordings:
+
+- **Recordings**: every `.ts` in the recordings folder; start a survey of any of them.
+- **A recording**: the video (streamed from any point, transcoded on the GPU) above a zoomable
+  timeline of what the detector saw: each graphic's shape match, the playing-surface share and
+  its threshold, black frames, silence, and the mutes. Hover for a thumbnail, click to play from
+  there. While playing, the sound is muted the way the survey (or tuned settings, or your
+  labels) would mute it.
+- **Labels**: mark where the ads really are (shift+drag on the timeline, or `I`/`O` while
+  watching). Tick "Reviewed" and the recording counts when scoring.
+- **Tune**: sliders for the settings. Each change replays the survey's saved trace in about a
+  second, without decoding video, and scores it against the labels: seconds of ads heard,
+  seconds of game muted, wrong mutes, late starts. "Score all reviewed recordings" checks the
+  settings across every game, so tuning one game doesn't break another. It shows the lines to
+  put in `docker-compose.yaml` when you find better values.
+- **Live**: what the proxy is doing now, and recent mute events.
+- **Jobs**: surveys and 10-minute clip renders started from the dashboard.
+
+It has its own sign-in (the shared [formlogin](https://github.com/jdogskizzle/formlogin)
+library): put `STUDIO_USERNAME` and `STUDIO_PASSWORD_HASH` in `.env` (see `.env.example`). It
+has no host port; put it behind a reverse proxy on the same Docker network, at any path (it
+uses relative links), e.g. Caddy `handle_path /admute/* { reverse_proxy admute-studio:8000 }`.
 
 ## Replaying recordings
 `./replay` runs the same detector and muting on a recording, faster than real time. The
@@ -62,9 +88,13 @@ detector only looks DELAY seconds ahead, like live, so results match what live T
 ./replay survey path/to/recording.ts                  # whole recording, ~20x real time
 ./replay render path/to/recording.ts 1:20:00 10:00    # a clip with muting applied
 ```
-- survey writes to `data/replay/<name>/`: `breaks.txt` (what would be muted), `timeline.csv`
-  (per second), `timeline.png` (1 px = 5 s: logo score, ad state, black, silence) and
-  `sheets/` (one frame every 10 s, 10 minutes per sheet). It learns the logo first if needed.
+- survey writes to `data/replay/<name>/`: `breaks.txt` and `result.json` (what would be muted),
+  `trace.npz` (per-frame scores, for tuning in the studio), `timeline.csv` (per second),
+  `timeline.png` (1 px = 5 s: logo score, ad state, black, silence) and `sheets/` (one frame
+  every 10 s, 10 minutes per sheet). It learns the logo first if needed, and keeps what it
+  learned for the next survey of that recording (`--fresh` learns from scratch).
+- Recordings decode on the CPU (MPEG-2 is cheap, and parallel surveys would queue on the GPU's
+  video decoder); `REPLAY_GPU=1` uses the GPU.
 - render uses the logo the survey learned and writes the clip to the review folder
   (mounted at `/review` in docker-compose.yaml).
 - Recordings must be inside a folder mounted in docker-compose.yaml; `./replay` translates

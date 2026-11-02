@@ -15,6 +15,7 @@ like live, so a clip sounds the way it would have if you'd watched it live.
 import argparse
 import asyncio
 import csv
+import json
 import logging
 import os
 import re
@@ -26,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from detect import AdDetector, write_png
+from detect import SETTINGS, AdDetector, write_png
 from pipeline import FFMPEG, DetectorProc, Pipeline
 from ts import PKT, SilentFrames
 
@@ -34,7 +35,9 @@ DATA = Path(os.environ.get("DATA", "/data")) / "replay"
 REVIEW = Path(os.environ.get("REVIEW", "/review"))
 DELAY = float(os.environ.get("DELAY", "10"))
 LAG = float(os.environ.get("REPLAY_LAG", "1.0"))   # live decoding runs about this far behind the tuner
-GPU = os.environ.get("DETECT_GPU", "1") == "1"
+# Recordings decode on the CPU by default: MPEG-2 is cheap, and several surveys at once
+# would queue on the GPU's single video decoder. REPLAY_GPU=1 decodes on the GPU instead.
+GPU = os.environ.get("REPLAY_GPU", "0") == "1"
 LEARN_PASS = 15 * 60                               # survey: learn the logo from this much video first
 
 log = logging.getLogger("admute")
@@ -190,8 +193,12 @@ async def survey(args):
     print(f"Surveying {path.name}\n  results in data/replay/{name}/", flush=True)
     sheet_proc = sheets(path, work / "sheets")
 
-    def make():
-        d = AdDetector(name, path.stem, work, fmt=hms, keep=None)
+    if args.fresh:
+        for old in (work / "logos").glob("*"):
+            old.unlink()
+
+    def make(trace=False):
+        d = AdDetector(name, path.stem, work, fmt=hms, keep=None, trace=trace)
         d.now = lambda: (d.last_t or 0) + LAG
         return d
 
@@ -203,9 +210,10 @@ async def survey(args):
         if det.mask is None:
             print("  no logo found in the first pass; the main pass will keep trying", flush=True)
 
-    det = make()
+    det = make(trace=True)
     took = await detect_file(path, det, label="")
     det.close()
+    det.save_trace(work / "trace.npz")
     sheet_proc.wait()
 
     csv_path = Path(det._csv_file.name)
@@ -219,6 +227,10 @@ async def survey(args):
         end = e if e != float("inf") else (det.last_t or s)
         lines.append(f"  {hms(s)} - {hms(end)}  ({end - s:.0f}s)")
     (work / "breaks.txt").write_text("\n".join(lines) + "\n")
+    (work / "result.json").write_text(json.dumps({
+        "recording": str(path), "length": det.last_t or 0, "took": took, "finished": time.time(),
+        "graphics": det._describe(), "settings": SETTINGS,
+        "breaks": [[s, e if e != float("inf") else (det.last_t or s)] for s, e in breaks]}, indent=1))
     print("\n" + "\n".join(lines), flush=True)
 
 
@@ -298,6 +310,7 @@ def main():
     s = sub.add_parser("survey", help="scan a whole recording")
     s.add_argument("recording")
     s.add_argument("--name", help="short name for the results folder (default: from the file name)")
+    s.add_argument("--fresh", action="store_true", help="forget what an earlier survey learned and learn again")
     r = sub.add_parser("render", help="render a clip with muting into the review library")
     r.add_argument("recording")
     r.add_argument("start", help="e.g. 1:20:00")

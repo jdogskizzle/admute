@@ -879,6 +879,8 @@ async function reviewView(name) {
 
   // ----- step 2: missed ads, as thumbnails of everything that wasn't muted -----
   function renderMissed(p) {
+    const grid = p.querySelector(".rv-thumbs");
+    if (grid) S.thumbScroll = grid.scrollTop;
     const gaps = [];
     let t = 0;
     for (const m of mutes) { if (m.s - t > 20) gaps.push([t, m.s]); t = Math.max(t, m.e); }
@@ -886,8 +888,7 @@ async function reviewView(name) {
     const thumbs = [];
     for (const [a, z] of gaps) for (let x = Math.ceil(a / 10) * 10 + 10; x < z - 5; x += 10) {
       if (L.ads.some(ad => x >= ad[0] && x < ad[1])) continue;
-      const sheet = Math.floor(x / 600) + 1, tile = Math.floor((x % 600) / 10);
-      thumbs.push(`<button class="th" data-t="${x}" title="${hms(x)}" style="background-image:url('api/rec/${encodeURIComponent(name)}/sheet/${sheet}.jpg');background-position:${(tile % 6) * 20}% ${Math.floor(tile / 6) * 100 / 9}%"></button>`);
+      thumbs.push(`<button class="th" data-t="${x}" title="${hms(x)}"><img loading="lazy" src="api/rec/${encodeURIComponent(name)}/thumb?t=${x}" alt=""><span>${hms(x)}</span></button>`);
     }
     p.innerHTML = S.edit ? `
       <h2>Mark the missed ad</h2>
@@ -900,6 +901,8 @@ async function reviewView(name) {
       <div class="rv-thumbs">${thumbs.join("") || `<p class="dim">Nothing unmuted to check.</p>`}</div>
       <div class="rv-actions"><button class="big primary" data-missed-done>${L.missed_checked ? "✓ Checked" : "Done: no more missed ads"}</button></div>
       <div id="missed-pick"></div>`;
+    const g2 = p.querySelector(".rv-thumbs");
+    if (g2 && S.thumbScroll) g2.scrollTop = S.thumbScroll;
   }
 
   // ----- events -----
@@ -917,9 +920,9 @@ async function reviewView(name) {
     if (b.hasAttribute("data-prev")) return go(Math.max(0, S.i - 1));
     if (b.hasAttribute("data-skip")) return go(Math.min(mutes.length - 1, S.i + 1));
     if (b.hasAttribute("data-replay")) { const sp = span(); if (sp) seek(sp[0] - 5); return; }
-    if (b.dataset.t) { const t = Number(b.dataset.t); seek(t - 3); S.pick = t;
+    if (b.dataset.t) { const t = Number(b.dataset.t); seek(t); S.pick = t;
       $("#missed-pick").innerHTML = `<div class="rv-pick">Playing ${hms(t)}. <button class="primary" data-mark>It's an ad</button></div>`; return; }
-    if (b.hasAttribute("data-mark")) { S.edit = [Math.round(S.pick - 3), Math.round(S.pick + 30)]; render(); return; }
+    if (b.hasAttribute("data-mark")) { S.edit = [Math.round(S.pick), Math.round(S.pick + 30)]; render(); return; }
     if (b.hasAttribute("data-save-missed")) {
       L.ads = L.ads.filter(a => !overlaps(a, S.edit[0], S.edit[1])).concat([S.edit.map(Math.round)]).sort((a, b) => a[0] - b[0]);
       S.edit = null; save(); toast("Saved the missed ad"); render(); return;

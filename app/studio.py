@@ -446,6 +446,8 @@ class Handler(BaseHTTPRequestHandler):
             if f.exists():
                 return self.send(200, f.read_bytes(), "image/jpeg", cache="max-age=600")
             return self.send(404, {"error": "no sheet"})
+        if what == "thumb":
+            return self.thumb(find(name), work, float(q.get("t", 0)))
         if what == "logo":
             f = work / "logos" / f"{name}.png"
             if f.exists():
@@ -454,6 +456,21 @@ class Handler(BaseHTTPRequestHandler):
         if what == "video":
             return self.video(find(name), float(q.get("t", 0)), int(q.get("h", 720)))
         return self.send(404, {"error": "not found"})
+
+    def thumb(self, path, work, t):
+        """The exact frame at second t (cached), for the review's missed-ads grid."""
+        t = max(0, int(t))
+        f = work / "thumbs" / f"{t}.jpg"
+        if not f.exists():
+            f.parent.mkdir(parents=True, exist_ok=True)
+            tmp = f.with_suffix(".tmp.jpg")
+            subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-ss", str(t), "-i", str(path),
+                            "-frames:v", "1", "-vf", "scale=192:108", "-q:v", "5", str(tmp)],
+                           stdin=subprocess.DEVNULL, timeout=30)
+            if not tmp.exists():
+                return self.send(404, {"error": "no frame"})
+            os.replace(tmp, f)
+        return self.send(200, f.read_bytes(), "image/jpeg", cache="max-age=86400")
 
     def video(self, path, start, height):
         height = height if height in (360, 540, 720, 1080) else 720

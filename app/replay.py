@@ -422,11 +422,15 @@ def train_scene(args):
             print(f"  {name[:60]}\n    logo rules:  ads heard {old[0]}s, game muted {old[1]}s, wrong mutes {old[2]}"
                   f"\n    scene check: ads heard {new[0]}s, game muted {new[1]}s, wrong mutes {new[2]}", flush=True)
     clf = Classifier.train(np.concatenate([g[1] for g in games]), np.concatenate([g[2] for g in games]))
-    clf.info = {"trained_on": [g[0] for g in games], "seconds": int(sum(len(g[2]) for g in games)),
+    from scene import show_title
+    titles = sorted({show_title(json.loads((DATA / g[0] / "result.json").read_text())["recording"].rsplit("/", 1)[-1][:-3])
+                     for g in games})
+    clf.info = {"trained_on": [g[0] for g in games], "titles": titles, "seconds": int(sum(len(g[2]) for g in games)),
                 "made": time.time(), "held_out": report}
     clf.save()
-    print(f"\nSaved the scene classifier ({clf.info['seconds']} seconds of video). Live TV picks it up "
-          "the next time a channel opens; surveys and the studio use it right away.", flush=True)
+    print(f"\nSaved the scene classifier ({clf.info['seconds']} seconds of video). It's used for: "
+          + ", ".join(titles) + " (other programs keep the logo rules).", flush=True)
+    print("Live TV picks it up the next time a channel opens; surveys and the studio use it right away.", flush=True)
 
 
 # --- render -----------------------------------------------------------------

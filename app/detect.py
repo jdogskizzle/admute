@@ -428,13 +428,15 @@ def scene_chances(trace, classifier):
     return out
 
 
-def replay_trace(trace, p, classifier="saved"):
+def replay_trace(trace, p, classifier="saved", title=None):
     """Mute ranges a survey would have made with settings p, from its saved trace (fast:
     no video). Learning isn't redone, so it's close to a full survey but not exact.
     classifier: the scene classifier to use ("saved": the trained one, None: none)."""
     p = {**SETTINGS, **p}
     if classifier == "saved":
         classifier = scene_mod.Classifier.load()
+    if title is not None and not scene_mod.covers(classifier, title):
+        classifier = None  # not a kind of program it learned from
     sp = scene_chances(trace, classifier)
     d = Decider(p, keep=None, splice=tuple(trace["splice"]) if "splice" in trace else (0, 0))
     f, sil, si = trace["frames"], trace["silences"], 0
@@ -463,7 +465,7 @@ def wall(t):
 
 
 class AdDetector:
-    def __init__(self, num, name, data_dir, fmt=None, now=None, keep=10, trace=False, live=False):
+    def __init__(self, num, name, data_dir, fmt=None, now=None, keep=10, trace=False, live=False, title=None):
         """fmt turns a stream time into a readable label; now is the current time on the same
         clock (live: arrival time; replay: how far the recording has been decoded).
         trace: keep per-frame scores (surveys save them for the studio to replay)."""
@@ -516,7 +518,9 @@ class AdDetector:
         self.scene_p, self._scene_sec, self._scene_job = None, None, None
         self._sync_scene = trace  # surveys wait for each result so they're repeatable; live never waits
         # Live TV: only during sports, per the guide. Recordings for the studio are games.
-        self.live, self._sports, self._sports_at = live, not live, 0.0
+        # Recordings: the title from the file name. Only programs the classifier learned from use it.
+        self.live, self._sports_at = live, 0.0
+        self._sports = not live and scene_mod.covers(self.classifier, title or scene_mod.show_title(name))
         if self.classifier:
             log.info("%s: scene check ready (learned from %d games)%s", num, len(self.classifier.info.get("trained_on", [])),
                      "; used during sports, per the guide" if live else "")
@@ -597,10 +601,11 @@ class AdDetector:
         if self.live and time.monotonic() - self._sports_at > 60:
             self._sports_at = time.monotonic()
             g = scene_mod.guide()
-            was, self._sports = self._sports, bool(g and g.sports_now(self.num, time.time()))
+            title = g.sports_now(self.num, time.time()) if g else None
+            was, self._sports = self._sports, scene_mod.covers(self.classifier, title)
             if self.classifier and was != self._sports:
-                log.info("%s: %s", self.num, "sports on (per the guide): scene check in use" if self._sports
-                         else "not sports (per the guide): logo rules in use")
+                log.info("%s: %s", self.num, f"{title} is on: scene check in use" if self._sports
+                         else "logo rules in use (no program the scene check learned from)")
         self.decider.step(t, [x.state() for x in self.graphics], share >= (sf.threshold() or 2), sbs,
                           self.scene_p if self._sports else None)
         if self.trace is not None:

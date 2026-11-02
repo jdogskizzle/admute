@@ -9,6 +9,7 @@ every graphic gone, and it knows the commentators are back before the scorebug i
 
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -128,6 +129,17 @@ class Classifier:
         return Classifier(wb[:-1], wb[-1])
 
 
+def show_title(name):
+    """The program's title from a recording name: "NFL Football 2026_11_01_... - A at B" or
+    "NFL Football - A at B 2026-11-01" -> "NFL Football"."""
+    return re.split(r"\s+(?:\d{4}[_-]\d|-\s)", name.strip(), maxsplit=1)[0].strip()
+
+
+def covers(classifier, title):
+    """Whether the classifier learned from this kind of program (by guide title)."""
+    return bool(classifier and title and title in classifier.info.get("titles", []))
+
+
 class Guide:
     """Whether a sports event is on a channel now, from an XMLTV guide (GUIDE_XMLTV). The scene
     check was learned from games, so live TV only uses it during programs the guide calls
@@ -154,14 +166,16 @@ class Guide:
                 if any((c.text or "").strip().lower() == "sports" for c in p.findall("category")):
                     a = datetime.strptime(p.get("start"), "%Y%m%d%H%M%S %z").timestamp()
                     b = datetime.strptime(p.get("stop"), "%Y%m%d%H%M%S %z").timestamp()
-                    sports.setdefault(p.get("channel"), []).append((a, b))
+                    sports.setdefault(p.get("channel"), []).append((a, b, (p.findtext("title") or "").strip()))
             self.sports, self.mtime = sports, mtime
         except Exception as exc:
             log.warning("couldn't read the guide %s: %s", self.path, exc)
 
     def sports_now(self, channel, now):
+        """Title of the sports program on now (or that ended less than GRACE ago), else None."""
         self._load()
-        return any(a <= now < b + self.GRACE for a, b in self.sports.get(str(channel), []))
+        on = [(a, t) for a, b, t in self.sports.get(str(channel), []) if a <= now < b + self.GRACE]
+        return max(on)[1] if on else None
 
 
 _guide = None

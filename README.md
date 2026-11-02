@@ -54,8 +54,12 @@ broadcast, even with every logo gone, which the logo rules can't. It mutes when 
 boundaries placed where the chance crossed one half (as far as `DELAY` allows) and snapped to a
 black frame or silence. Train it in the studio (Recordings page) or with `./replay train`
 after reviewing games; it reports how it does on each game when that game is left out. On
-the first two games (FOX and CBS) that cut ads heard by about 60-70% and game muted by up to
-75%. Without a trained classifier, the logo rules below decide.
+the first two games (FOX and CBS) that cut ads heard by about 75% and game muted by 15-80%,
+with fewer wrong mutes. It's only used for the kinds of program it learned from, by guide
+title (e.g. "NFL Football"): live TV checks the guide (`GUIDE_XMLTV`) for the program on now,
+recordings use their file name. A football-trained model did badly on hockey, so hockey keeps
+the logo rules until a hockey game is reviewed and trained on. Everything else uses the logo
+rules below.
 
 It's a show while any graphic is on screen. An ad is "all graphics gone for `AD_MIN` seconds";
 it ends when one is back for `SHOW_MIN` seconds. Following two graphics matters for sports:

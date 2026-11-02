@@ -214,7 +214,9 @@ def simulate(name, settings):
     tr = trace(name)
     if tr is None:
         return None
-    breaks = [[round(s, 2), round(e, 2)] for s, e in replay_trace(tr, settings)]
+    from scene import show_title
+    path = find(name)
+    breaks = [[round(s, 2), round(e, 2)] for s, e in replay_trace(tr, settings, title=show_title(path.stem) if path else None)]
     out = {"breaks": breaks}
     labels = read_json(REPLAY / name / "labels.json") or {}
     if labels.get("ads"):

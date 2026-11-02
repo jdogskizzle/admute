@@ -94,7 +94,9 @@ The `studio` service is a web dashboard for checking and tuning the detector on 
 - **Jobs**: surveys and 10-minute clip renders started from the dashboard.
 
 It has its own sign-in (the shared [formlogin](https://github.com/jdogskizzle/formlogin)
-library): put `STUDIO_USERNAME` and `STUDIO_PASSWORD_HASH` in `.env` (see `.env.example`). It
+library): set the password with `docker compose exec studio python3 -m formlogin passwd`
+(saved in `data/studio/login.json`, used right away), or on first start on the setup page,
+with the code from `docker logs admute-studio`. It
 has no host port; put it behind a reverse proxy on the same Docker network, at any path (it
 uses relative links), e.g. Caddy `handle_path /admute/* { reverse_proxy admute-studio:8000 }`.
 

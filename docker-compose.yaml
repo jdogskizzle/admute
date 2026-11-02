@@ -18,7 +18,7 @@ x-common: &common
   build:
     context: .
     additional_contexts:
-      formlogin: ${FORMLOGIN_SRC:-https://github.com/jdogskizzle/formlogin.git#v1.0.0}   # sign-in library; FORMLOGIN_SRC=<folder> to build from a local copy
+      formlogin: ${FORMLOGIN_SRC:-https://github.com/jdogskizzle/formlogin.git#v2.0.0}   # sign-in library; FORMLOGIN_SRC=<folder> to build from a local copy
   restart: unless-stopped
   user: "1000:1000"         # owner of the files written to ./data and the review folder
   volumes:
@@ -50,7 +50,8 @@ services:
       interval: 60s
 
   # Dashboard: recordings, surveys, timeline + video, labels, tuning, live status.
-  # Reached through Caddy at /admute/ (no host port). Login in .env (see .env.example).
+  # Reached through Caddy at /admute/ (no host port). Set the login with
+  #   docker compose exec studio python3 -m formlogin passwd
   studio:
     <<: *common
     container_name: admute-studio

@@ -8,7 +8,7 @@
   decoding, and scores the result on every labelled recording.
 - Live: what the admute proxy is doing right now.
 
-Sign-in is formlogin (STUDIO_USERNAME / STUDIO_PASSWORD_HASH). Everything machine-specific
+Sign-in is formlogin (password in /data/studio/login.json, set with python -m formlogin passwd). Everything machine-specific
 comes from the environment set in docker-compose.yaml.
 """
 
@@ -527,8 +527,8 @@ def settings_from(q):
 if __name__ == "__main__":
     STATE.mkdir(parents=True, exist_ok=True)
     JOBS = Jobs()
-    LOGIN = formlogin.Login.from_env(  # STUDIO_USERNAME, STUDIO_PASSWORD_HASH, STUDIO_AUTH
-        "STUDIO", "admute-studio", str(STATE / "session.key"), title="admute studio",
+    LOGIN = formlogin.Login.from_env(  # password: python -m formlogin passwd (see README)
+        "STUDIO", "admute-studio", str(STATE), title="admute studio",
         accent=("#b4472f", "#e0785c"),
         icon="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1' y='3' width='14' height='10' rx='2' fill='%23e0785c'/></svg>")
     print(time.strftime("%F %T"), f"admute studio on :{PORT}", flush=True)

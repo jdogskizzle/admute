@@ -43,6 +43,7 @@ LOGO_OFF = _env("LOGO_OFF", 0.3)               # below this: it's gone
 EDGE_ON, EDGE_OFF = 0.85, 0.75
 GRAPHICS = int(_env("GRAPHICS", 2))            # how many graphics (corners) to follow
 PICTURE_MIN = 30 * FPS                         # frames of a graphic needed before its picture is used
+SURFACE = _env("SURFACE", 1)                   # 0 turns off the playing-surface check
 MERGE = _env("MERGE", 15)                      # an ad starting this soon after one ended continues the break
 AD_MIN = _env("AD_MIN", 4)                     # seconds without the logo before muting
 SHOW_MIN = _env("SHOW_MIN", 3)                 # seconds with the logo back before unmuting
@@ -95,11 +96,15 @@ class Graphic:
         self.n, self.level = n, level
         self.edge = self.shape = None
 
-    def measure(self, g, edges, learn):
-        """Score this frame; `learn` lets a clearly visible graphic refine its picture."""
+    def measure(self, g, edges, learn, hi=None):
+        """Score this frame; `learn` lets a clearly visible graphic refine its picture.
+        `hi` is the same frame at twice the size, for a sharper picture of small graphics."""
         self.edge = float(edges[self.mask].mean())
         y0, y1, x0, x1 = self.box
-        hp = highpass(g[y0:y1, x0:x1].astype(np.float32))
+        patch = g[y0:y1, x0:x1] if hi is None else hi[2 * y0:2 * y1, 2 * x0:2 * x1]
+        hp = highpass(patch.astype(np.float32))
+        if hp.shape != self.picture.shape:  # picture was learned at another size: learn it again
+            self.picture, self.n = np.zeros(hp.shape, np.float32), 0
         if learn and self.edge >= 0.8 * self.level:
             self.n += 1
             self.picture += max(1.0 / self.n, 1.0 / LEARN_TAU) * (hp - self.picture)
@@ -122,6 +127,54 @@ class Graphic:
 
     def score(self):
         return self.shape if self.shape is not None else min(1.0, self.edge / self.level)
+
+
+class Surface:
+    """The colour that fills most of the screen during the show, like ice or grass.
+
+    Sports replays and close-ups often drop the on-screen graphics, but still show the
+    playing surface, while ads almost never do. So while enough of the screen is this colour,
+    a missing logo doesn't start a mute. It's only used on channels where it clearly tells
+    the show from the ads (learned from both), and it never ends a mute.
+    """
+    Y_BINS, C_BINS = 3, 5  # odd number of colour bins, so neutral (white, grey) sits in the middle one
+
+    def __init__(self, hist=None, show=0.0, ad=0.0, n_show=0, n_ad=0):
+        self.hist = np.zeros(self.Y_BINS * self.C_BINS ** 2, np.float32) if hist is None else hist
+        self.show, self.ad, self.n_show, self.n_ad = show, ad, n_show, n_ad
+        self.share = 0.0
+
+    def bins(self, y, uv):
+        """Bin number per pixel of the lower two thirds of the picture (graphics live up top)."""
+        yy = y[::2, ::2][H // 6:]
+        c = uv[H // 6:].astype(np.int16)
+        return ((yy.astype(np.int16) * self.Y_BINS) >> 8) * self.C_BINS ** 2 \
+            + ((c[..., 0] * self.C_BINS) >> 8) * self.C_BINS + ((c[..., 1] * self.C_BINS) >> 8)
+
+    def measure(self, y, uv, show, ad):
+        b = self.bins(y, uv)
+        top = int(self.hist.argmax())
+        self.share = float(np.count_nonzero(b == top)) / b.size
+        if show:  # graphics on screen: learn what the show looks like
+            self.n_show += 1
+            h = np.bincount(b.ravel(), minlength=self.hist.size) / b.size
+            self.hist += max(1.0 / self.n_show, 1.0 / LEARN_TAU) * (h - self.hist)
+            self.show += max(1.0 / self.n_show, 1.0 / LEARN_TAU) * (self.share - self.show)
+        elif ad:  # well inside a break: learn how much of it ads show
+            self.n_ad += 1
+            self.ad += max(1.0 / self.n_ad, 1.0 / LEARN_TAU) * (self.share - self.ad)
+
+    def threshold(self):
+        """Share of the screen that counts as "the show is on", or None while it isn't useful."""
+        if not SURFACE or self.n_show < LEARN_MIN or self.n_ad < 60 * FPS:
+            return None
+        if self.show < 0.3 or self.show - self.ad < 0.25:  # not a clear difference on this channel
+            return None
+        return (self.show + self.ad) / 2
+
+    def visible(self):
+        th = self.threshold()
+        return th is not None and self.share >= th
 
 
 def wall(t):
@@ -147,6 +200,7 @@ class AdDetector:
         self.freq = np.zeros((H - 1, W - 1), np.float32)  # how often each pixel is an edge
         self.seen = 0
         self.graphics = []  # Graphic per followed corner, biggest first
+        self.surface = Surface()
         if self.state_path.exists():
             try:
                 with np.load(self.state_path) as d:
@@ -159,6 +213,9 @@ class AdDetector:
                             self.graphics.append(Graphic(corner, mask, tuple(int(v) for v in d[f"g{i}_box"]),
                                                          d[f"g{i}_picture"].astype(np.float32),
                                                          int(d[f"g{i}_n"]), float(d[f"g{i}_level"])))
+                    if "surface_hist" in d:
+                        self.surface = Surface(d["surface_hist"].astype(np.float32), float(d["surface_show"]),
+                                               float(d["surface_ad"]), int(d["surface_n_show"]), int(d["surface_n_ad"]))
                     if not self.graphics and "level" in d:  # saved by an older version: one graphic
                         self._old_level = float(d["level"])
             except Exception as exc:
@@ -168,6 +225,7 @@ class AdDetector:
 
         self.score = None
         self.logo, self.changed_at = True, None
+        self.surface_at = None  # last time the playing surface was on screen
         # Not armed until the logo has actually been seen, so a show without it isn't muted.
         self.state, self.armed = "show", False
         self.intervals = []  # [start, end] mute ranges, in stream arrival time
@@ -189,7 +247,7 @@ class AdDetector:
 
     # --- inputs -------------------------------------------------------------
 
-    def frame(self, t, img):
+    def frame(self, t, img, uv=None, hi=None):
         self.last_t = t
         g = img.astype(np.int16)
         black = np.count_nonzero(g > 40) < g.size * 0.01
@@ -212,8 +270,13 @@ class AdDetector:
                     self.save()
 
         for x in self.graphics:
-            x.measure(g, edges, learn=not black and self.state != "ad")
+            x.measure(g, edges, learn=not black and self.state != "ad", hi=hi)
         self.score = max((x.score() for x in self.graphics), default=None)
+        if uv is not None and not black and self.graphics:
+            inside = self.state == "ad" and self.intervals and t - self.intervals[-1][0] > 10
+            self.surface.measure(img, uv, show=self.logo and self.state == "show", ad=inside)
+            if self.surface.visible():
+                self.surface_at = t
         self._decide(t)
         self._log_second(t, black)
         if time.monotonic() - self._last_save > 120:
@@ -300,8 +363,8 @@ class AdDetector:
                 if not self.armed and held >= ARM:
                     self.armed = True
                     self._event(f"logo on screen since {self.fmt(self.changed_at)}, ad muting armed")
-            elif held >= AD_MIN and self.armed:
-                start = self._snap(self.changed_at)
+            elif self.armed and t - max(self.changed_at, self.surface_at or 0) >= AD_MIN:
+                start = self._snap(max(self.changed_at, self.surface_at or 0))
                 self.state = "ad"
                 prev = self.intervals[-1] if self.intervals else None
                 if prev and start - prev[1] <= MERGE:
@@ -365,7 +428,9 @@ class AdDetector:
             for i, x in enumerate(self.graphics):
                 extra.update({f"g{i}_corner": x.corner, f"g{i}_box": np.array(x.box), f"g{i}_picture": x.picture,
                               f"g{i}_n": x.n, f"g{i}_level": x.level})
-            np.savez_compressed(f, freq=self.freq, seen=self.seen, **extra)
+            sf = self.surface
+            np.savez_compressed(f, freq=self.freq, seen=self.seen, surface_hist=sf.hist, surface_show=sf.show,
+                                surface_ad=sf.ad, surface_n_show=sf.n_show, surface_n_ad=sf.n_ad, **extra)
         os.replace(tmp, self.state_path)
         img = np.clip(self.freq * 160, 0, 160).astype(np.uint8)
         if self.mask is not None:
@@ -386,6 +451,8 @@ class AdDetector:
             "graphics": [{"corner": x.corner, "pixels": int(x.mask.sum()),
                           "picture_learned": x.n >= PICTURE_MIN,
                           "score": None if x.edge is None else round(x.score(), 3)} for x in self.graphics],
+            "surface": {"share": round(self.surface.share, 2), "usual_in_show": round(self.surface.show, 2),
+                        "usual_in_ads": round(self.surface.ad, 2), "in_use": self.surface.threshold() is not None},
             "state": self.state,
             "armed": self.armed,
             "ads_muted": self.ads,

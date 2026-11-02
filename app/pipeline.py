@@ -83,10 +83,10 @@ class DetectorProc:
         r, w = os.pipe()
         if self.gpu:
             hw = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-            vf = f"fps={FPS},scale_cuda={W}:{H},hwdownload,format=nv12,format=gray"
+            vf = f"fps={FPS},scale_cuda={2 * W}:{2 * H},hwdownload,format=nv12"
         else:
             hw = []
-            vf = f"fps={FPS},scale={W}:{H}:flags=area,format=gray"
+            vf = f"fps={FPS},scale={2 * W}:{2 * H}:flags=area,format=nv12"
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostats", "-fflags", "+discardcorrupt",
                *hw, "-f", "mpegts", "-i", "pipe:0",
                "-map", "0:v:0", "-vf", vf, "-f", "rawvideo", "pipe:1",
@@ -139,11 +139,18 @@ class DetectorProc:
         self.kill()
 
     async def _video(self):
-        n, size = 0, W * H
+        # nv12 at twice the analysis size: brightness, then colour at half size. The full
+        # size is only used to recognise the small on-screen graphics.
+        n, px = 0, 4 * W * H
+        size = px * 3 // 2
         try:
             while True:
                 buf = await self.p.stdout.readexactly(size)
-                self.det.frame(self.t0 + n / FPS, np.frombuffer(buf, np.uint8).reshape(H, W))
+                a = np.frombuffer(buf, np.uint8)
+                hi = a[:px].reshape(2 * H, 2 * W)
+                lo = hi.reshape(H, 2, W, 2).mean(axis=(1, 3)).astype(np.uint8)
+                uv = a[px:].reshape(H, W, 2)[::2, ::2]
+                self.det.frame(self.t0 + n / FPS, lo, uv, hi)
                 n += 1
         except asyncio.IncompleteReadError:
             pass

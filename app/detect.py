@@ -601,8 +601,9 @@ class AdDetector:
         if self.live and time.monotonic() - self._sports_at > 60:
             self._sports_at = time.monotonic()
             g = scene_mod.guide()
-            title = g.sports_now(self.num, time.time()) if g else None
-            was, self._sports = self._sports, scene_mod.covers(self.classifier, title)
+            titles = g.sports_now(self.num, time.time()) if g else []
+            title = next((x for x in titles if scene_mod.covers(self.classifier, x)), None)
+            was, self._sports = self._sports, title is not None
             if self.classifier and was != self._sports:
                 log.info("%s: %s", self.num, f"{title} is on: scene check in use" if self._sports
                          else "logo rules in use (no program the scene check learned from)")

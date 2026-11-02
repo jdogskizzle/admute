@@ -172,10 +172,11 @@ class Guide:
             log.warning("couldn't read the guide %s: %s", self.path, exc)
 
     def sports_now(self, channel, now):
-        """Title of the sports program on now (or that ended less than GRACE ago), else None."""
+        """Titles of the sports programs on now or that ended less than GRACE ago, newest first:
+        a game running long is still on while the guide has moved on to the postgame show."""
         self._load()
-        on = [(a, t) for a, b, t in self.sports.get(str(channel), []) if a <= now < b + self.GRACE]
-        return max(on)[1] if on else None
+        on = sorted(((a, t) for a, b, t in self.sports.get(str(channel), []) if a <= now < b + self.GRACE), reverse=True)
+        return [t for a, t in on]
 
 
 _guide = None

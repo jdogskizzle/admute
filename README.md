@@ -30,6 +30,14 @@ corners), which takes about 5 minutes of watching a channel the first time. It t
 picture of each one and recognises it by shape, which still works for a see-through logo over
 a bright background. It's saved in `data/logos/<channel>.npz` and reused.
 
+Sports also have a playing surface (ice, grass) that fills the screen during play, even in
+replays that drop the graphics, but rarely in ads. The detector learns its colour, and while it
+stays on screen (`SURFACE_HOLD` seconds) a missing logo doesn't start a mute.
+
+Some channels (CBS) cut to every break with a black frame and/or silence, while their own
+stat graphics and studio cut-ins have none. The detector learns which channels do that, and on
+those it only mutes a lost logo from such a cut, or after `SPLICE_WAIT` seconds.
+
 It's a show while any graphic is on screen. An ad is "all graphics gone for `AD_MIN` seconds";
 it ends when one is back for `SHOW_MIN` seconds. Following two graphics matters for sports:
 replays and close-ups usually drop the scorebug but keep the station logo. Black frames and
@@ -53,7 +61,9 @@ docker logs -f admute
 it counts as on screen / below which it's gone; default 0.35 / 0.3), `GRAPHICS` (how many to follow, default 2), `MERGE` (seconds; ads closer than this count as one break), `AD_MIN`, `SHOW_MIN`,
 `AD_MAX` (unmute if the "ad" lasts this long, e.g. a show with no logo; default 300),
 `SURFACE` (0 turns off the playing-surface check), `SURFACE_AT` (where its threshold sits between
-the share usual in ads, 0, and in the show, 1; default 0.5), `SNAP`,
+the share usual in ads, 0, and in the show, 1; default 0.5), `SURFACE_HOLD` (seconds; default 2),
+`SPLICE` (wait for a black frame or silence before muting: -1 learn per channel, 0 never, 1 always),
+`SPLICE_WAIT` (mute anyway after this many seconds; default 20), `SNAP`,
 `ARM` (seconds the logo must be on screen before muting is armed), `LEARN_MIN` (minutes).
 
 ## Studio (dashboard)

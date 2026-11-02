@@ -83,15 +83,17 @@ async function listView() {
       const score = sc ? `<span title="seconds of ads heard">${sc.ad_heard}s</span> / <span title="seconds of game muted">${sc.show_muted}s</span>` : "";
       const act = r.job || r.recording ? "" : `<button data-survey="${esc(r.name)}">${r.surveyed ? "Survey again" : "Survey"}</button>`;
       return `<tr class="click" data-open="${esc(r.name)}">
-        <td><b>${esc(r.title)}</b><div class="dim hide-sm" style="font-size:12px">${esc(r.path)} · ${gb(r.size)}</div></td>
-        <td class="num">${r.length ? hms(r.length) : ""}</td>
-        <td>${status}</td>
-        <td class="num">${r.surveyed ? r.breaks : ""}</td>
-        <td>${r.labelled ? `<span class="tag good">${r.label_count} ads, reviewed</span>` : r.label_count ? `<span class="tag">${r.label_count} ads, draft</span>` : ""}</td>
+        <td><b>${esc(r.title)}</b><div class="dim hide-sm" style="font-size:12px">${esc(r.path)} · ${gb(r.size)}</div>
+          <div class="dim show-sm" style="font-size:12px">${[r.length ? hms(r.length) : "", r.surveyed ? `${r.breaks} mutes` : "", r.label_count ? `${r.label_count} labels` : "", sc ? `heard ${sc.ad_heard}s · muted ${sc.show_muted}s` : ""].filter(Boolean).join(" · ")}</div>
+          <div class="show-sm" style="margin-top:4px">${status}</div></td>
+        <td class="num hide-sm">${r.length ? hms(r.length) : ""}</td>
+        <td class="hide-sm">${status}</td>
+        <td class="num hide-sm">${r.surveyed ? r.breaks : ""}</td>
+        <td class="hide-sm">${r.labelled ? `<span class="tag good">${r.label_count} ads, reviewed</span>` : r.label_count ? `<span class="tag">${r.label_count} ads, draft</span>` : ""}</td>
         <td class="num hide-sm">${score}</td>
         <td style="text-align:right">${act}</td></tr>`;
     }).join("");
-    $("#list").innerHTML = rows ? `<table><thead><tr><th>Recording</th><th class="num">Length</th><th>Status</th><th class="num">Mutes</th><th>Labels</th><th class="num hide-sm" title="ads heard / game muted, against the labels">Heard / muted</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+    $("#list").innerHTML = rows ? `<table><thead><tr><th>Recording</th><th class="num hide-sm">Length</th><th class="hide-sm">Status</th><th class="num hide-sm">Mutes</th><th class="hide-sm">Labels</th><th class="num hide-sm" title="ads heard / game muted, against the labels">Heard / muted</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
       : `<div class="empty">No .ts recordings found.</div>`;
   };
   $("#list").addEventListener("click", async e => {
@@ -143,8 +145,10 @@ async function recView(name) {
           <span><i style="background:var(--g0)"></i>graphic 1 match</span><span><i style="background:var(--g1)"></i>graphic 2 match</span>
           <span><i style="background:var(--surface)"></i>playing surface</span><span><i style="background:var(--black)"></i>black</span><span><i style="background:var(--silent)"></i>silence</span>
           <span><i style="background:var(--label)"></i>labelled ads</span><span><i style="background:var(--survey)"></i>survey mutes</span><span><i style="background:var(--tuned)"></i>tuned mutes</span>
-          <span class="dim">scroll to zoom · drag to pan · shift+drag to label an ad · <span class="kbd">space</span> play · <span class="kbd">←</span><span class="kbd">→</span> 5 s · <span class="kbd">I</span>/<span class="kbd">O</span> set ad start/end</span>
+          <span class="dim hide-sm">scroll to zoom · drag to pan · shift+drag to label an ad · <span class="kbd">space</span> play · <span class="kbd">←</span><span class="kbd">→</span> 5 s · <span class="kbd">I</span>/<span class="kbd">O</span> set ad start/end</span>
+          <span class="dim show-sm">tap to play from there · drag to pan</span>
         </div>
+        <div class="zoombar"><button data-zoom-btn="in">Zoom in</button><button data-zoom-btn="out">Zoom out</button><button data-zoom-btn="play">Around playhead</button><button data-zoom-btn="all">Whole game</button></div>
         <div class="timeline-wrap"><canvas class="timeline" id="tl"></canvas><div class="tip" id="tip" hidden></div></div>
       </div>
       <div class="card side">
@@ -232,9 +236,10 @@ async function recView(name) {
     const lane = (key, label) => { const [y, h] = LANES[key]; g.fillStyle = css("--panel2"); g.fillRect(0, y, W, h); g.fillStyle = dim; if (label) g.fillText(label, 6, y - 4); };
     lane("g", "graphics (shape match)"); lane("surf", "playing surface share"); lane("ev");
     lane("lab"); lane("sur"); lane("tun");
+    const nameAt = [];  // lane names, drawn last on a backing so bars don't hide them
     g.fillStyle = dim;
     [["lab", "labels"], ["sur", "survey"], ["tun", "tuned"], ["ev", "black / silence"]].forEach(([k, n]) => {
-      const [y, h] = LANES[k]; g.textAlign = "right"; g.fillText(n, W - 6, y + h - 3); g.textAlign = "left";
+      const [y, h] = LANES[k]; nameAt.push([n, y + h - 3]);
     });
 
     // spans
@@ -331,6 +336,14 @@ async function recView(name) {
       g.fillText(hms(t), x + 2, ay + 13);
     }
 
+    g.textAlign = "right";
+    for (const [n, y] of nameAt) {
+      const w = g.measureText(n).width;
+      g.fillStyle = css("--panel"); g.globalAlpha = 0.85; g.fillRect(W - w - 10, y - 10, w + 8, 13); g.globalAlpha = 1;
+      g.fillStyle = dim; g.fillText(n, W - 6, y);
+    }
+    g.textAlign = "left";
+
     // shift-drag selection
     if (R.drag?.mode === "label") {
       const a = X(Math.min(R.drag.t0, R.drag.t1)), b = X(Math.max(R.drag.t0, R.drag.t1));
@@ -350,6 +363,13 @@ async function recView(name) {
     R.view = [a, a + w]; draw();
   }
   R.zoomTo = zoomTo;
+  document.querySelectorAll("[data-zoom-btn]").forEach(b => b.onclick = () => {
+    const [a, z] = R.view, mid = vid.currentSrc ? now() : (a + z) / 2, w = z - a;
+    if (b.dataset.zoomBtn === "in") zoomTo(mid - w / 6, mid + w / 6);
+    else if (b.dataset.zoomBtn === "out") zoomTo(mid - w * 1.5, mid + w * 1.5);
+    else if (b.dataset.zoomBtn === "play") zoomTo(mid - 150, mid + 150);
+    else zoomTo(0, R.len);
+  });
   canvas.addEventListener("wheel", e => {
     e.preventDefault();
     const t = T(e.offsetX), f = Math.exp((e.deltaY || e.deltaX) * 0.0015);
@@ -402,7 +422,7 @@ async function recView(name) {
         (surfThreshold(i) != null ? `/${surfThreshold(i).toFixed(2)}` : "");
     }
     const hasSheets = R.d.result;
-    tip.innerHTML = (hasSheets ? `<div class="thumb" style="background-image:url('api/rec/${encodeURIComponent(name)}/sheet/${sheet}.jpg');background-position:-${(tile % 6) * 256}px -${Math.floor(tile / 6) * 144}px"></div>` : "") +
+    tip.innerHTML = (hasSheets ? `<div class="thumb" style="background-image:url('api/rec/${encodeURIComponent(name)}/sheet/${sheet}.jpg');background-position:${(tile % 6) * 20}% ${Math.floor(tile / 6) * 100 / 9}%"></div>` : "") +
       `<div><b>${hms(t)}</b> ${vals}</div>`;
     tip.hidden = false;
     const W = canvas.clientWidth, tw = 270;

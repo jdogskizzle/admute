@@ -43,7 +43,7 @@ services:
     environment:
       <<: *detector
       SOURCE_M3U: http://dvr-guard:8000/lineup.m3u   # channel playlist: dvr-guard shares the tuner (or the tuner's own, e.g. http://<hdhomerun>/lineup.m3u)
-      CHANNELS: "4.1"         # comma list like 4.1,5.1, "group:<group-title>" or "all"
+      CHANNELS: "4.1,5.1,7.1,16.1,22.2"   # comma list like 4.1,5.1, "group:<group-title>" or "all"
       LINGER: 15              # keep a channel open this long after the last viewer leaves
       GUIDE_XMLTV: /guide/guide.xml   # the scene check runs live only during programs this guide calls sports
     volumes:

@@ -72,6 +72,7 @@ setInterval(jobBadge, 5000); jobBadge();
 let META = null; // defaults + tunable ranges
 async function listView() {
   main.innerHTML = `<h1>Recordings</h1><div class="sub">Tap a game to check what it would mute, one mute at a time. Details has the graphs and tuning.</div><div class="card" id="list"><div class="empty">Loading…</div></div>
+    <h2 style="margin-top:22px">Scene check</h2><div class="card" id="scene"><div class="empty">Loading…</div></div>
     <h2 style="margin-top:22px">Side-by-side ad layouts</h2><div class="card" id="layouts"><div class="empty">Loading…</div></div>`;
   const drawLayouts = async () => {
     const ls = await api("api/layouts");
@@ -85,6 +86,22 @@ async function listView() {
     try { await api("api/jobs", { json: { kind: "layouts" } }); toast("Learning layouts; see Jobs"); } catch (err) { toast(err.message); }
   });
   drawLayouts();
+  const drawScene = async () => {
+    const c = await api("api/scene");
+    const rows = Object.entries(c.held_out || {}).map(([n, r]) => `<tr><td>${esc(n.replace(/_/g, " "))}</td>
+      <td class="num">${r.before[0]}s → <b>${r.after[0]}s</b></td><td class="num">${r.before[1]}s → <b>${r.after[1]}s</b></td>
+      <td class="num">${r.before[2]} → <b>${r.after[2]}</b></td></tr>`).join("");
+    $("#scene").innerHTML = `<p class="dim" style="margin-top:0">An image model that learns from your reviewed games what the broadcast looks like and what ads look like. Once trained, it decides the mutes; the logo rules are only the fallback. Review more games and train again to make it better.</p>
+      ${c.trained ? `<p>Trained on ${(c.trained_on || []).length} game${(c.trained_on || []).length === 1 ? "" : "s"} (${Math.round((c.seconds || 0) / 3600 * 10) / 10} hours), ${ago(c.made)}.</p>` : `<p><b>Not trained yet.</b></p>`}
+      ${rows ? `<table><thead><tr><th>Each game, scored by a model trained on the others</th><th class="num">ads heard</th><th class="num">game muted</th><th class="num">wrong mutes</th></tr></thead><tbody>${rows}</tbody></table>
+        <div class="dim" style="font-size:12px">logo rules → scene check</div>` : ""}
+      <div class="row"><button data-train>Train on reviewed games</button></div>`;
+  };
+  $("#scene").addEventListener("click", async e => {
+    if (!e.target.closest("[data-train]")) return;
+    try { await api("api/jobs", { json: { kind: "train" } }); toast("Training; see Jobs"); } catch (err) { toast(err.message); }
+  });
+  drawScene();
   const draw = async () => {
     const d = await api("api/recordings"); META = d;
     const rows = d.recordings.map(r => {
@@ -249,7 +266,7 @@ async function recView(name) {
 
     // lane backgrounds and names
     const lane = (key, label) => { const [y, h] = LANES[key]; g.fillStyle = css("--panel2"); g.fillRect(0, y, W, h); g.fillStyle = dim; if (label) g.fillText(label, 6, y - 4); };
-    lane("g", "graphics (shape match)"); lane("surf", "playing surface share"); lane("lay", "side-by-side layout match"); lane("ev");
+    lane("g", "graphics (shape match)"); lane("surf", "playing surface share"); lane("lay", "scene check: chance of an ad (teal) · side-by-side layout (orange)"); lane("ev");
     lane("lab"); lane("sur"); lane("tun");
     const nameAt = [];  // lane names, drawn last on a backing so bars don't hide them
     g.fillStyle = dim;
@@ -330,6 +347,7 @@ async function recView(name) {
       // side-by-side layouts: best match, scaled so 1.0 = like the examples
       const ll = LANES.lay;
       (tl.layouts || []).forEach(L => { series(L.score, css("--tuned"), ll, 1.1); });
+      if (tl.scene) { g.globalAlpha = 0.8; series(tl.scene, css("--label"), ll, 1); g.globalAlpha = 1; }
       if ((tl.layouts || []).length) {
         const th = Math.min(...tl.layouts.map(L => L.threshold)), y = ll[0] + ll[1] - th / 1.1 * ll[1];
         g.strokeStyle = dim; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke(); g.setLineDash([]);
@@ -588,6 +606,8 @@ async function recView(name) {
       SNAP: "Look this far back for a black frame or silence.", SURFACE: "1 = playing surface on screen holds off a mute.",
       SURFACE_AT: "Where the surface threshold sits between ads (0) and game (1).", AD_MAX: "Give up on a mute this long.",
       SURFACE_HOLD: "Seconds the surface must stay on screen to count.",
+      SCENE: "1 = the trained scene check decides (when there is one).", SCENE_ON: "Mute when the scene check's recent average is above this.",
+      SCENE_OFF: "Unmute when it drops below this.", SCENE_WINDOW: "Seconds it averages over.",
       LAYOUT: "1 = a learned side-by-side ad layout mutes right away.", LAYOUT_HOLD: "Seconds a layout must match first.",
       SPLICE: "Wait for a black frame or silence before muting: -1 learn per channel, 0 never, 1 always.",
       SPLICE_WAIT: "When waiting for one: mute anyway after this many seconds without graphics.",

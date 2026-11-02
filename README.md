@@ -45,6 +45,18 @@ edges, checks them against everything else in the labelled recordings so they do
 the game or the network's own boxed score updates, and saves them in `data/layouts/`. Every
 channel watches for them, and one on screen mutes right away.
 
+**Scene check (the main signal once trained).** An image model (CLIP, run with onnxruntime
+on the CPU, about 35 ms a frame) describes one frame a second, and a small classifier learned
+from your reviewed games turns that into the chance it's an ad. It knows a stat card over a
+sideline shot, a studio cut-in or the commentators coming back from a break are the
+broadcast, even with every logo gone, which the logo rules can't. It mutes when the last
+`SCENE_WINDOW` seconds average above `SCENE_ON` and unmutes below `SCENE_OFF`, with the
+boundaries placed where the chance crossed one half (as far as `DELAY` allows) and snapped to a
+black frame or silence. Train it in the studio (Recordings page) or with `./replay train`
+after reviewing games; it reports how it does on each game when that game is left out. On
+the first two games (FOX and CBS) that cut ads heard by about 60-70% and game muted by up to
+75%. Without a trained classifier, the logo rules below decide.
+
 It's a show while any graphic is on screen. An ad is "all graphics gone for `AD_MIN` seconds";
 it ends when one is back for `SHOW_MIN` seconds. Following two graphics matters for sports:
 replays and close-ups usually drop the scorebug but keep the station logo. Black frames and
@@ -70,7 +82,8 @@ it counts as on screen / below which it's gone; default 0.35 / 0.3), `GRAPHICS` 
 `SURFACE` (0 turns off the playing-surface check), `SURFACE_AT` (where its threshold sits between
 the share usual in ads, 0, and in the show, 1; default 0.5), `SURFACE_HOLD` (seconds; default 2),
 `SPLICE` (wait for a black frame or silence before muting: -1 learn per channel, 0 never, 1 always),
-`SPLICE_WAIT` (mute anyway after this many seconds; default 20), `LAYOUT` (0 ignores learned
+`SPLICE_WAIT` (mute anyway after this many seconds; default 20), `SCENE` (0 ignores the scene check), `SCENE_ON` / `SCENE_OFF` (0.9 / 0.5), `SCENE_WINDOW` (seconds, 6),
+`LAYOUT` (0 ignores learned
 side-by-side layouts), `LAYOUT_HOLD` (seconds a layout must match; default 0.6), `SNAP`,
 `ARM` (seconds the logo must be on screen before muting is armed), `LEARN_MIN` (minutes).
 
@@ -108,6 +121,7 @@ detector only looks DELAY seconds ahead, like live, so results match what live T
 ./replay survey path/to/recording.ts                  # whole recording, ~20x real time
 ./replay render path/to/recording.ts 1:20:00 10:00    # a clip with muting applied
 ./replay layouts                                      # learn side-by-side ad layouts from labels
+./replay train                                        # learn the scene check from reviewed games
 ```
 - survey writes to `data/replay/<name>/`: `breaks.txt` and `result.json` (what would be muted),
   `trace.npz` (per-frame scores, for tuning in the studio), `timeline.csv` (per second),

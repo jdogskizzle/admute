@@ -1,3 +1,4 @@
 # The image only installs packages; the app is mounted at runtime. Keep the build context small.
 *
 !Dockerfile
+!tools/export_scene_model.py

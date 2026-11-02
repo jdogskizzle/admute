@@ -149,8 +149,8 @@ class DetectorProc:
                 a = np.frombuffer(buf, np.uint8)
                 hi = a[:px].reshape(2 * H, 2 * W)
                 lo = hi.reshape(H, 2, W, 2).mean(axis=(1, 3)).astype(np.uint8)
-                uv = a[px:].reshape(H, W, 2)[::2, ::2]
-                self.det.frame(self.t0 + n / FPS, lo, uv, hi)
+                uvf = a[px:].reshape(H, W, 2)  # colour at the detector's size (for the scene check)
+                self.det.frame(self.t0 + n / FPS, lo, uvf[::2, ::2], hi, uvf)
                 n += 1
         except asyncio.IncompleteReadError:
             pass

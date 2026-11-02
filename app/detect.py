@@ -18,7 +18,10 @@ import struct
 import time
 import zlib
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import scene as scene_mod
 
 import numpy as np
 
@@ -66,7 +69,13 @@ SPLICE_WAIT = _env("SPLICE_WAIT", 20)
 # learned from labelled examples (replay.py layouts) into DATA/layouts, shared by all channels.
 LAYOUT = _env("LAYOUT", 1)                     # 0 ignores the learned layouts
 LAYOUT_HOLD = _env("LAYOUT_HOLD", 0.6)         # seconds a layout must match before muting
-SETTINGS = dict(LAYOUT=LAYOUT, LAYOUT_HOLD=LAYOUT_HOLD, LOGO_ON=LOGO_ON, LOGO_OFF=LOGO_OFF, AD_MIN=AD_MIN, SHOW_MIN=SHOW_MIN, MERGE=MERGE,
+# Scene check (scene.py): a classifier learned from reviewed recordings gives the chance each
+# second is an ad. When one has been trained, it decides; the logo rules are the fallback.
+SCENE = _env("SCENE", 1)                       # 0: ignore the scene classifier
+SCENE_ON = _env("SCENE_ON", 0.9)               # mute when the recent average chance is above this
+SCENE_OFF = _env("SCENE_OFF", 0.5)             # unmute when it drops below this
+SCENE_WINDOW = _env("SCENE_WINDOW", 6)        # seconds averaged
+SETTINGS = dict(SCENE=SCENE, SCENE_ON=SCENE_ON, SCENE_OFF=SCENE_OFF, SCENE_WINDOW=SCENE_WINDOW, LAYOUT=LAYOUT, LAYOUT_HOLD=LAYOUT_HOLD, LOGO_ON=LOGO_ON, LOGO_OFF=LOGO_OFF, AD_MIN=AD_MIN, SHOW_MIN=SHOW_MIN, MERGE=MERGE,
                 AD_MAX=AD_MAX, ARM=ARM, SNAP=SNAP, SURFACE=SURFACE, SURFACE_AT=SURFACE_AT,
                 SURFACE_HOLD=SURFACE_HOLD, SPLICE=SPLICE, SPLICE_WAIT=SPLICE_WAIT)
 SPLICE_BREAK = 60      # mutes at least this long count as real breaks when learning about marks
@@ -105,6 +114,9 @@ def highpass(p):
 
 def normalize(p):
     return (p - p.mean()) / (p.std() + 1e-3)
+
+
+_SCENE_POOL = ThreadPoolExecutor(1, thread_name_prefix="scene")
 
 
 def edge_map(g):
@@ -251,6 +263,7 @@ class Decider:
         self.splice = list(splice)  # [breaks seen, breaks that started with a mark]
         self.loss_marked = None  # whether the break being muted started at a black frame or silence
         self.layout_since = None  # when a side-by-side ad layout came on screen
+        self.scene_hist = deque(maxlen=120)  # (second, chance it's an ad), from the scene classifier
         # Not armed until the logo has actually been seen, so a show without it isn't muted.
         self.state, self.armed = "show", False
         self.intervals = []  # [start, end] mute ranges, in stream arrival time
@@ -258,10 +271,13 @@ class Decider:
         self.blacks = deque(maxlen=300)
         self.silences = deque(maxlen=600)
 
-    def step(self, t, states, surface=False, layout=False):
+    def step(self, t, states, surface=False, layout=False, scene=None):
         """states: on/gone/None per graphic for this frame; surface: playing surface on screen;
-        layout: a learned side-by-side ad layout matches this frame."""
+        layout: a learned side-by-side ad layout matches this frame; scene: the scene
+        classifier's chance that this second is an ad (None without a classifier)."""
         p = self.p
+        if scene is not None and p["SCENE"]:
+            return self._scene_step(t, scene, layout)
         if layout and p["LAYOUT"]:
             if self.layout_since is None:
                 self.layout_since = t
@@ -340,6 +356,45 @@ class Decider:
                 self.state, self.armed = "show", False
                 self.event(f"no logo for {p['AD_MAX']:.0f}s, probably a show without it; unmuted until the logo is back")
 
+    def _scene_step(self, t, scene, layout):
+        """Mute when the scene classifier is sure it's an ad over the last few seconds, unmute
+        when it's sure it's the broadcast again. Boundaries go back to where the chance
+        crossed one half (as far as the delay allows), then to a nearby black frame or silence."""
+        p, sec = self.p, int(t)
+        if not self.scene_hist or self.scene_hist[-1][0] != sec:
+            self.scene_hist.append((sec, scene))
+        win = [(s, q) for s, q in self.scene_hist if s > t - p["SCENE_WINDOW"]]
+        avg = sum(q for _, q in win) / len(win)
+        floor = t - (_env("DELAY", 10) - 1)  # viewers haven't heard anything after this yet
+        sbs = layout and p["LAYOUT"]
+        if self.state == "show":
+            if avg >= p["SCENE_ON"] or sbs:
+                first = next((s for s, q in win if q > 0.5), sec)
+                start = max(self._snap(first), floor)
+                self.state = "ad"
+                prev = self.intervals[-1] if self.intervals else None
+                if prev and start - prev[1] <= p["MERGE"]:
+                    gap = start - prev[1]
+                    prev[1] = math.inf
+                    self.event(f"ad again after a {gap:.0f}s gap, staying muted")
+                else:
+                    self.intervals.append([start, math.inf])
+                    if self.keep:
+                        self.intervals = self.intervals[-self.keep:]
+                    self.ads += 1
+                    self.event(f"ad start, muting from {self.fmt(start)} (scene check {avg:.2f})")
+        else:
+            cur = self.intervals[-1]
+            if not sbs and avg <= p["SCENE_OFF"]:
+                last_ad = max((s for s, q in win if q > 0.5), default=sec - p["SCENE_WINDOW"])
+                cur[1] = max(cur[0], self._snap(last_ad + 1), floor)
+                self.state = "show"
+                self.event(f"ad end at {self.fmt(cur[1])}, muted {cur[1] - cur[0]:.0f}s (scene check {avg:.2f})")
+            elif t - cur[0] >= p["AD_MAX"]:
+                cur[1] = t
+                self.state = "show"
+                self.event(f"muted for {p['AD_MAX']:.0f}s, unmuting")
+
     def splice_needed(self):
         mode = self.p["SPLICE"]
         if mode >= 0:
@@ -361,10 +416,26 @@ TRACE_COLS = ["t", "black", "surface_share", "surface_show", "surface_ad", "surf
     [f"g{i}_{k}" for i in range(GRAPHICS) for k in ("shape", "edge")]
 
 
-def replay_trace(trace, p):
+def scene_chances(trace, classifier):
+    """The scene classifier's chance of an ad for each frame of a trace (None if it can't)."""
+    if classifier is None or "scene_feats" not in trace or not len(trace["scene_sec"]):
+        return None
+    secs = trace["scene_sec"]
+    q = classifier.p(trace["scene_feats"].astype(np.float32))
+    t = trace["frames"][:, 0]
+    i = np.searchsorted(secs, np.floor(t), side="right") - 1  # the latest second already checked
+    out = np.where(i >= 0, q[np.clip(i, 0, len(q) - 1)], np.nan)
+    return out
+
+
+def replay_trace(trace, p, classifier="saved"):
     """Mute ranges a survey would have made with settings p, from its saved trace (fast:
-    no video). Learning isn't redone, so it's close to a full survey but not exact."""
+    no video). Learning isn't redone, so it's close to a full survey but not exact.
+    classifier: the scene classifier to use ("saved": the trained one, None: none)."""
     p = {**SETTINGS, **p}
+    if classifier == "saved":
+        classifier = scene_mod.Classifier.load()
+    sp = scene_chances(trace, classifier)
     d = Decider(p, keep=None, splice=tuple(trace["splice"]) if "splice" in trace else (0, 0))
     f, sil, si = trace["frames"], trace["silences"], 0
     ng = (f.shape[1] - 6) // 2
@@ -380,7 +451,8 @@ def replay_trace(trace, p):
         states = [graphic_state(None if math.isnan(row[6 + 2 * i]) else row[6 + 2 * i], row[7 + 2 * i], p)
                   for i in range(ng) if not math.isnan(row[7 + 2 * i])]
         th = surface_threshold(bool(row[5]), row[3], row[4], p)
-        d.step(t, states, th is not None and row[2] >= th, bool(sbs[k]))
+        d.step(t, states, th is not None and row[2] >= th, bool(sbs[k]),
+               None if sp is None or math.isnan(sp[k]) else float(sp[k]))
     end = f[-1, 0] if len(f) else 0.0
     return [(s, float(end) if e == math.inf else e) for s, e in d.intervals]
 
@@ -391,7 +463,7 @@ def wall(t):
 
 
 class AdDetector:
-    def __init__(self, num, name, data_dir, fmt=None, now=None, keep=10, trace=False):
+    def __init__(self, num, name, data_dir, fmt=None, now=None, keep=10, trace=False, live=False):
         """fmt turns a stream time into a readable label; now is the current time on the same
         clock (live: arrival time; replay: how far the recording has been decoded).
         trace: keep per-frame scores (surveys save them for the studio to replay)."""
@@ -437,8 +509,17 @@ class AdDetector:
         self.score = None
         self._splice = getattr(self, "_splice", (0, 0))
         self.decider = Decider(SETTINGS, self.fmt, lambda: self.now(), self._event, keep, self._splice)
-        self.trace = ([], [], []) if trace else None  # (frame rows, silence times, layout scores)
+        self.trace = ([], [], [], []) if trace else None  # (frame rows, silences, layout scores, scene features)
         self.layouts = Layout.load_all()
+        self.scene_on = scene_mod.available() and SCENE
+        self.classifier = scene_mod.Classifier.load() if self.scene_on else None
+        self.scene_p, self._scene_sec, self._scene_job = None, None, None
+        self._sync_scene = trace  # surveys wait for each result so they're repeatable; live never waits
+        # Live TV: only during sports, per the guide. Recordings for the studio are games.
+        self.live, self._sports, self._sports_at = live, not live, 0.0
+        if self.classifier:
+            log.info("%s: scene check ready (learned from %d games)%s", num, len(self.classifier.info.get("trained_on", [])),
+                     "; used during sports, per the guide" if live else "")
         if self.layouts:
             log.info("%s: watching for %d side-by-side ad layout%s", num, len(self.layouts), "s" * (len(self.layouts) > 1))
 
@@ -456,7 +537,31 @@ class AdDetector:
 
     # --- inputs -------------------------------------------------------------
 
-    def frame(self, t, img, uv=None, hi=None):
+    def _scene(self, t, img, uvf):
+        """Once a second: the scene check's features, and the chance it's an ad."""
+        if not self.scene_on or uvf is None:
+            return
+        if self._scene_job is not None and self._scene_job.done():
+            self._scene_result(*self._scene_job.result())
+            self._scene_job = None
+        sec = int(t)
+        if sec == self._scene_sec or self._scene_job is not None:
+            return  # live: skip a second rather than queue up if the CPU is busy
+        self._scene_sec = sec
+        rgb = scene_mod.picture(img, uvf)
+        job = _SCENE_POOL.submit(lambda: (sec, scene_mod.features(rgb)))
+        if self._sync_scene:
+            self._scene_result(*job.result())
+        else:
+            self._scene_job = job
+
+    def _scene_result(self, sec, f):
+        if self.trace is not None:
+            self.trace[3].append((sec, f))
+        if self.classifier:
+            self.scene_p = float(self.classifier.p(f))
+
+    def frame(self, t, img, uv=None, hi=None, uvf=None):
         self.last_t = t
         g = img.astype(np.int16)
         black = np.count_nonzero(g > 40) < g.size * 0.01
@@ -488,7 +593,16 @@ class AdDetector:
             inside = self.state == "ad" and self.intervals and t - self.intervals[-1][0] > 10
             sf.measure(img, uv, show=self.logo and self.state == "show", ad=inside)
             share = sf.share
-        self.decider.step(t, [x.state() for x in self.graphics], share >= (sf.threshold() or 2), sbs)
+        self._scene(t, img, uvf)
+        if self.live and time.monotonic() - self._sports_at > 60:
+            self._sports_at = time.monotonic()
+            g = scene_mod.guide()
+            was, self._sports = self._sports, bool(g and g.sports_now(self.num, time.time()))
+            if self.classifier and was != self._sports:
+                log.info("%s: %s", self.num, "sports on (per the guide): scene check in use" if self._sports
+                         else "not sports (per the guide): logo rules in use")
+        self.decider.step(t, [x.state() for x in self.graphics], share >= (sf.threshold() or 2), sbs,
+                          self.scene_p if self._sports else None)
         if self.trace is not None:
             row = [t, float(black), share, sf.show, sf.ad, float(sf.learned())]
             for i in range(GRAPHICS):
@@ -515,11 +629,13 @@ class AdDetector:
         return any(s <= t < e for s, e in self.intervals)
 
     def save_trace(self, path):
-        rows, sil, lay = self.trace
+        rows, sil, lay, _ = self.trace
         np.savez_compressed(path, frames=np.array(rows, np.float32).reshape(-1, len(TRACE_COLS)),
                             layouts=np.array(lay, np.float32).reshape(len(rows), len(self.layouts)),
                             layout_names=np.array([x.name for x in self.layouts]),
                             layout_thresholds=np.array([x.threshold for x in self.layouts], np.float32),
+                            scene_sec=np.array([s for s, _ in self.trace[3]], np.int32),
+                            scene_feats=np.array([f for _, f in self.trace[3]], np.float16).reshape(-1, 512),
                             silences=np.array(sorted(sil), np.float64), cols=np.array(TRACE_COLS),
                             splice=np.array(self._splice))
 

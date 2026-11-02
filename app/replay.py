@@ -360,6 +360,75 @@ def learn_layouts(args):
 FPS_LEARN = 5
 
 
+# --- scene classifier -----------------------------------------------------------
+
+def reviewed_scenes():
+    """(name, features per second, ad or not per second) for every reviewed recording whose
+    survey saved scene features."""
+    out = []
+    for d in sorted(DATA.iterdir()):
+        try:
+            labels = json.loads((d / "labels.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if not labels.get("reviewed") or not (d / "trace.npz").exists():
+            continue
+        with np.load(d / "trace.npz") as tr:
+            if "scene_feats" not in tr or not len(tr["scene_sec"]):
+                print(f"  {d.name}: surveyed before the scene check existed; survey it again to use it", flush=True)
+                continue
+            secs, feats = tr["scene_sec"], tr["scene_feats"].astype(np.float32)
+            trace = {k: tr[k] for k in tr.files}
+        ads = [a for a in labels.get("ads", [])]
+        y = np.array([any(a[0] <= s + 0.5 < a[1] for a in ads) for s in secs])
+        out.append((d.name, feats, y, trace, ads))
+    return out
+
+
+def train_scene(args):
+    """Learn the scene classifier from every reviewed recording, after checking how well it
+    does on each one when that one is left out of the training."""
+    from detect import replay_trace
+    from scene import Classifier
+    games = reviewed_scenes()
+    if not games:
+        sys.exit("No reviewed recordings with scene features yet. Review a game in the studio, and survey it "
+                 "again if it was surveyed before the scene check existed.")
+    print(f"Training on {len(games)} reviewed recording(s): " + ", ".join(g[0] for g in games), flush=True)
+
+    def score(breaks, ads, length):
+        n = int(length) + 1
+        m, a = np.zeros(n, bool), np.zeros(n, bool)
+        for s, e in breaks:
+            m[int(s):int(e)] = True
+        for x in ads:
+            a[int(x[0]):int(x[1])] = True
+        wrong = 0
+        for s, e in breaks:
+            seg = a[int(s):max(int(s) + 1, int(e))]
+            wrong += seg.mean() < 0.5
+        return int((a & ~m).sum()), int((m & ~a).sum()), int(wrong)
+
+    report = {}
+    if len(games) > 1:
+        print("\nEach recording scored by a classifier trained on the others:", flush=True)
+        for i, (name, X, y, trace, ads) in enumerate(games):
+            rest = [g for j, g in enumerate(games) if j != i]
+            clf = Classifier.train(np.concatenate([g[1] for g in rest]), np.concatenate([g[2] for g in rest]))
+            length = float(trace["frames"][-1, 0])
+            old = score(replay_trace(trace, {}, classifier=None), ads, length)
+            new = score(replay_trace(trace, {}, classifier=clf), ads, length)
+            report[name] = {"before": old, "after": new}
+            print(f"  {name[:60]}\n    logo rules:  ads heard {old[0]}s, game muted {old[1]}s, wrong mutes {old[2]}"
+                  f"\n    scene check: ads heard {new[0]}s, game muted {new[1]}s, wrong mutes {new[2]}", flush=True)
+    clf = Classifier.train(np.concatenate([g[1] for g in games]), np.concatenate([g[2] for g in games]))
+    clf.info = {"trained_on": [g[0] for g in games], "seconds": int(sum(len(g[2]) for g in games)),
+                "made": time.time(), "held_out": report}
+    clf.save()
+    print(f"\nSaved the scene classifier ({clf.info['seconds']} seconds of video). Live TV picks it up "
+          "the next time a channel opens; surveys and the studio use it right away.", flush=True)
+
+
 # --- render -----------------------------------------------------------------
 
 async def render(args):
@@ -444,9 +513,12 @@ def main():
     r.add_argument("--name")
     r.add_argument("--warmup", type=float, default=30, help="seconds of detection before the clip starts")
     sub.add_parser("layouts", help="learn side-by-side ad layouts from labelled examples")
+    sub.add_parser("train", help="learn the scene classifier from reviewed recordings")
     args = ap.parse_args()
     if args.cmd == "layouts":
         return learn_layouts(args)
+    if args.cmd == "train":
+        return train_scene(args)
     asyncio.run(survey(args) if args.cmd == "survey" else render(args))
 
 

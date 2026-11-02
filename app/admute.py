@@ -150,7 +150,7 @@ class Session:
         if not self.pipe.demux.audio:
             log.warning("%s: no AC-3 audio track found; ads on this channel can't be muted "
                         "(only AC-3 audio, as used by US broadcast TV, is supported so far)", self.num)
-        self.pipe.detector = AdDetector(self.num, self.name, DATA)
+        self.pipe.detector = AdDetector(self.num, self.name, DATA, live=True)
         gpu = DETECT_GPU
         while True:
             self.proc = DetectorProc(self.pipe.detector, gpu)

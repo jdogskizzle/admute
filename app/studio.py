@@ -49,6 +49,7 @@ TUNABLE = {
     "LOGO_ON": (0.05, 0.9, 0.01), "LOGO_OFF": (0.02, 0.8, 0.01), "AD_MIN": (1, 10, 0.5),
     "SHOW_MIN": (1, 10, 0.5), "MERGE": (0, 60, 1), "ARM": (0, 60, 1), "SNAP": (0, 6, 0.5),
     "SURFACE": (0, 1, 1), "SURFACE_AT": (0.1, 0.9, 0.05), "SURFACE_HOLD": (0, 5, 0.5),
+    "SCENE": (0, 1, 1), "SCENE_ON": (0.5, 0.98, 0.02), "SCENE_OFF": (0.05, 0.6, 0.05), "SCENE_WINDOW": (3, 20, 1),
     "SPLICE": (-1, 1, 1), "SPLICE_WAIT": (5, 60, 1), "LAYOUT": (0, 1, 1), "LAYOUT_HOLD": (0, 3, 0.2),
     "AD_MAX": (60, 600, 10),
 }
@@ -154,7 +155,17 @@ def timeline(name):
         for i, nm in enumerate(tr["layout_names"]):
             lays.append({"name": str(nm), "threshold": float(tr["layout_thresholds"][i]),
                          "score": mean(tr["layouts"][:, i])})
-    return {"length": n, "graphics": graphics, "layouts": lays, "surface": mean(2), "surface_show": mean(3),
+    scene = None
+    if "scene_feats" in tr and len(tr["scene_sec"]):
+        from scene import Classifier
+        c = Classifier.load()
+        if c:
+            q = c.p(tr["scene_feats"].astype(np.float32))
+            scene = [None] * n
+            for sec_, v in zip(tr["scene_sec"].tolist(), q.tolist()):
+                if 0 <= sec_ < n:
+                    scene[sec_] = round(v, 3)
+    return {"length": n, "graphics": graphics, "layouts": lays, "scene": scene, "surface": mean(2), "surface_show": mean(3),
             "surface_ad": mean(4), "surface_learned": any_(5), "black": any_(1), "silent": sil.tolist()}
 
 
@@ -246,11 +257,12 @@ class Jobs:
         (STATE / "jobs").mkdir(parents=True, exist_ok=True)
 
     def start(self, kind, name, **kw):
-        path = None if kind == "layouts" else find(name)
-        if path is None and kind != "layouts":
+        whole = kind in ("layouts", "train")  # jobs about all recordings, not one
+        path = None if whole else find(name)
+        if path is None and not whole:
             raise ValueError("no such recording")
-        if kind == "layouts" and any(j["kind"] == "layouts" and j["state"] == "running" for j in self.jobs):
-            raise ValueError("already learning layouts")
+        if whole and any(j["kind"] == kind and j["state"] == "running" for j in self.jobs):
+            raise ValueError("that's already running")
         if kind == "survey":
             if self.active_for(name):
                 raise ValueError("a job is already running for this recording")
@@ -258,6 +270,8 @@ class Jobs:
             what = "Survey" + (" (learn again)" if kw.get("fresh") else "")
         elif kind == "layouts":
             args, what = ["layouts"], "Learn side-by-side layouts"
+        elif kind == "train":
+            args, what = ["train"], "Train the scene check"
         elif kind == "render":
             start, length = float(kw["start"]), float(kw.get("length", 600))
             if not 0 <= start or not 10 <= length <= 3600:
@@ -422,6 +436,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, live())
         if path == "/api/layouts":
             return self.send(200, layouts())
+        if path == "/api/scene":
+            from scene import Classifier
+            c = Classifier.load()
+            return self.send(200, {"trained": bool(c), **(c.info if c else {})})
         m = re.fullmatch(r"/api/layouts/(layout-\d+)\.png", path)
         if m and (REPLAY.parent / "layouts" / f"{m.group(1)}.png").exists():
             return self.send(200, (REPLAY.parent / "layouts" / f"{m.group(1)}.png").read_bytes(), "image/png")

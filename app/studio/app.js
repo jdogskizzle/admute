@@ -7,6 +7,26 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
+// Video: browsers that play HLS themselves (Safari, iPhone) get the whole recording as an
+// HLS playlist and seek within it. Others get an mp4 stream from the chosen second, restarted
+// for jumps outside what's loaded (st.base is where that stream starts in the recording).
+const HLS = !!document.createElement("video").canPlayType("application/vnd.apple.mpegurl");
+function seekVideo(vid, st, name, t, slack = 0) {
+  if (HLS) {
+    const src = `api/rec/${encodeURIComponent(name)}/hls.m3u8?h=${st.h}`;
+    st.base = 0;
+    if (st.src !== src || !vid.currentSrc) {
+      st.src = src; st.pending = t; vid.src = src;
+      vid.addEventListener("loadedmetadata", () => { vid.currentTime = st.pending; }, { once: true });
+    } else if (vid.readyState >= 1) vid.currentTime = t;
+    else st.pending = t;
+    return;
+  }
+  const rel = t - st.base, b = vid.buffered;
+  if (vid.currentSrc && rel >= 0 && b.length && rel <= b.end(b.length - 1) + slack) vid.currentTime = rel;
+  else { st.base = t; vid.src = `api/rec/${encodeURIComponent(name)}/video?t=${t.toFixed(1)}&h=${st.h}`; }
+}
+
 function hms(t, frac) {
   if (t == null || !isFinite(t)) return "–";
   const neg = t < 0; t = Math.abs(t);
@@ -204,9 +224,7 @@ async function recView(name) {
   // --- video ---
   function seek(t, play = true) {
     t = clamp(t, 0, R.len);
-    const rel = t - R.base, b = vid.buffered;
-    if (vid.currentSrc && rel >= 0 && b.length && rel <= b.end(b.length - 1)) vid.currentTime = rel;
-    else { R.base = t; vid.src = `api/rec/${encodeURIComponent(name)}/video?t=${t.toFixed(1)}&h=${R.h}`; }
+    seekVideo(vid, R, name, t);
     $("#hint").hidden = true;
     if (play) vid.play().catch(() => {});
     draw();
@@ -782,9 +800,7 @@ async function reviewView(name) {
   const now = () => S.base + (vid.currentTime || 0);
   function seek(t, play = true) {
     t = clamp(t, 0, len);
-    const rel = t - S.base, b = vid.buffered;
-    if (vid.currentSrc && rel >= 0 && b.length && rel <= b.end(b.length - 1) + 0.5) vid.currentTime = rel;
-    else { S.base = t; vid.src = `api/rec/${encodeURIComponent(name)}/video?t=${t.toFixed(1)}&h=${S.h}`; }
+    seekVideo(vid, S, name, t, 0.5);
     if (play) vid.play().catch(() => {});
   }
 

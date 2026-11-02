@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -377,6 +378,120 @@ def video_cmd(path, start, height):
             "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof", "pipe:1"]
 
 
+# HLS, for iPhones and Safari: they won't play the endless mp4 stream above (no length, no
+# byte ranges). The playlist lists the whole recording in SEG-second pieces, so the player's
+# own scrubber covers all of it. One ffmpeg run makes the pieces in order from wherever the
+# player asks; asking for a piece far from it restarts it there. It pauses when it gets too
+# far ahead of the player, and old pieces are deleted.
+SEG = 6
+HLS_AHEAD = 10   # pieces made before the player asks for them
+HLS_KEEP = 4     # pieces kept behind the one the player last asked for
+
+_durations = {}
+
+
+def duration(path):
+    key = (path, path.stat().st_mtime)
+    if key not in _durations:
+        out = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+                             capture_output=True, text=True, timeout=30).stdout
+        _durations[key] = float(out.strip() or 0)
+    return _durations[key]
+
+
+def hls_playlist(path, height):
+    n = math.ceil(duration(path) / SEG)
+    last = duration(path) - (n - 1) * SEG
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{SEG + 1}", "#EXT-X-MEDIA-SEQUENCE:0",
+             "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-INDEPENDENT-SEGMENTS"]
+    for i in range(n):
+        lines += [f"#EXTINF:{SEG if i < n - 1 else max(last, 0.1):.3f},", f"hls/{i}.ts?h={height}"]
+    return "\n".join(lines + ["#EXT-X-ENDLIST", ""]).encode()
+
+
+class HlsMaker:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = self.key = None
+        self.first = self.asked = 0
+        self.dir = Path(os.environ.get("HLS_TMP", "/tmp")) / "admute-hls"
+        threading.Thread(target=self._pace, daemon=True).start()
+
+    def _made(self):
+        """Index of the newest finished piece (-1 if none)."""
+        done = [int(f.stem) for f in self.dir.glob("*.ts") if f.stem.isdigit()]
+        return max(done, default=-1)
+
+    def _start(self, path, height, n):
+        self._stop()
+        self.dir.mkdir(parents=True, exist_ok=True)
+        for f in self.dir.iterdir():
+            f.unlink(missing_ok=True)
+        deint = interlaced(path)
+        if GPU:
+            hw = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+            vf = ("yadif_cuda=0:-1:1," if deint else "") + f"scale_cuda=-2:{height}"
+            venc = ["-c:v", "h264_nvenc", "-preset", "p3", "-b:v", "5M", "-maxrate", "8M", "-bufsize", "8M", "-forced-idr", "1"]
+        else:
+            hw = []
+            vf = ("yadif," if deint else "") + f"scale=-2:{height}"
+            venc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-sc_threshold", "0"]
+        start = n * SEG
+        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-ss", f"{start}", *hw, "-i", str(path),
+               "-map", "0:v:0", "-map", "0:a:0", "-vf", vf, *venc, "-g", "600",
+               "-force_key_frames", f"expr:gte(t,n_forced*{SEG})",
+               "-c:a", "aac", "-ac", "2", "-b:a", "160k", "-output_ts_offset", f"{start}",
+               "-f", "hls", "-hls_time", str(SEG), "-hls_list_size", "0", "-start_number", str(n),
+               "-hls_flags", "temp_file", "-hls_segment_filename", str(self.dir / "%d.ts"), str(self.dir / "out.m3u8")]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.key, self.first, self.asked = (path, height), n, n
+
+    def _stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGCONT)  # in case it's paused
+            self.proc.kill()
+            self.proc.wait()
+        self.proc = None
+
+    def piece(self, path, height, n):
+        """The bytes of piece n, made if needed (None if it couldn't be)."""
+        f = self.dir / f"{n}.ts"
+        with self.lock:
+            running = self.proc is not None and self.proc.poll() is None
+            coming = running and self.first <= n and self._made() < n <= self._made() + 3
+            if self.key != (path, height) or not (f.exists() or coming):
+                self._start(path, height, n)
+            self.asked = n
+            if self.proc and self.proc.poll() is None:
+                self.proc.send_signal(signal.SIGCONT)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if f.exists():  # ffmpeg renames a piece into place once it's finished
+                try:
+                    return f.read_bytes()
+                except FileNotFoundError:
+                    return None
+            if self.key != (path, height) or self.proc is None or (self.proc.poll() is not None and not f.exists()):
+                return None
+            time.sleep(0.05)
+        return None
+
+    def _pace(self):
+        while True:
+            time.sleep(0.5)
+            with self.lock:
+                if not self.proc or self.proc.poll() is not None:
+                    continue
+                made = self._made()
+                self.proc.send_signal(signal.SIGSTOP if made - self.asked > HLS_AHEAD else signal.SIGCONT)
+                for f in self.dir.glob("*.ts"):
+                    if f.stem.isdigit() and int(f.stem) < self.asked - HLS_KEEP:
+                        f.unlink(missing_ok=True)
+
+
+HLS = HlsMaker()
+
+
 # --- live --------------------------------------------------------------------------
 
 def live():
@@ -447,6 +562,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, (REPLAY.parent / "layouts" / f"{m.group(1)}.png").read_bytes(), "image/png")
         if path == "/api/score-all":
             return self.send(200, score_all(settings_from(q)))
+        m = re.fullmatch(r"/api/rec/([\w.-]+)/(?:hls\.m3u8|hls/(\d+)\.ts)", path)
+        if m:
+            rec = find(m.group(1))
+            if rec is None:
+                return self.send(404, {"error": "no such recording"})
+            height = int(q.get("h", 720)) if q.get("h", "720").isdigit() else 720
+            height = height if height in (360, 540, 720, 1080) else 720
+            if m.group(2) is None:
+                return self.send(200, hls_playlist(rec, height), "application/vnd.apple.mpegurl")
+            body = HLS.piece(rec, height, int(m.group(2)))
+            if body is None:
+                return self.send(503, {"error": "couldn't make that part of the video"})
+            return self.send(200, body, "video/mp2t", cache="private, max-age=3600")
         m = re.fullmatch(r"/api/rec/([\w.-]+)(?:/(\w+))?(?:/(\d+)\.jpg)?", path)
         if not m:
             return self.send(404, {"error": "not found"})

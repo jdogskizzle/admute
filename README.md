@@ -95,7 +95,8 @@ side-by-side layouts), `LAYOUT_HOLD` (seconds a layout must match; default 0.6),
 The `studio` service is a web dashboard for checking and tuning the detector on recordings:
 
 - **Recordings**: every `.ts` in the recordings folder; start a survey of any of them.
-- **A recording**: the video (streamed from any point, transcoded on the GPU) above a zoomable
+- **A recording**: the video (streamed from any point, transcoded on the GPU; as HLS for
+  Safari and iPhones, at `api/rec/<name>/hls.m3u8?h=720`) above a zoomable
   timeline of what the detector saw: each graphic's shape match, the playing-surface share and
   its threshold, black frames, silence, and the mutes. Hover for a thumbnail, click to play from
   there. While playing, the sound is muted the way the survey (or tuned settings, or your

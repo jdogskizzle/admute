@@ -50,8 +50,9 @@ function route() {
   timers.forEach(clearInterval); timers = [];
   const h = location.hash.slice(1) || "/";
   const [, view, arg] = h.split("/");
-  document.querySelectorAll("nav a").forEach(a => a.classList.toggle("on", a.dataset.nav === (view === "rec" ? "recordings" : view || "recordings")));
+  document.querySelectorAll("nav a").forEach(a => a.classList.toggle("on", a.dataset.nav === (["rec", "review"].includes(view) ? "recordings" : view || "recordings")));
   if (view === "rec" && arg) return recView(decodeURIComponent(arg));
+  if (view === "review" && arg) return reviewView(decodeURIComponent(arg));
   if (view === "live") return liveView();
   if (view === "jobs") return jobsView();
   return listView();
@@ -70,7 +71,7 @@ setInterval(jobBadge, 5000); jobBadge();
 // ---------- recordings ----------
 let META = null; // defaults + tunable ranges
 async function listView() {
-  main.innerHTML = `<h1>Recordings</h1><div class="sub">Survey a recording to see what would be muted, then open it to check, label and tune.</div><div class="card" id="list"><div class="empty">Loading…</div></div>
+  main.innerHTML = `<h1>Recordings</h1><div class="sub">Tap a game to check what it would mute, one mute at a time. Details has the graphs and tuning.</div><div class="card" id="list"><div class="empty">Loading…</div></div>
     <h2 style="margin-top:22px">Side-by-side ad layouts</h2><div class="card" id="layouts"><div class="empty">Loading…</div></div>`;
   const drawLayouts = async () => {
     const ls = await api("api/layouts");
@@ -94,7 +95,8 @@ async function listView() {
       else status = `<span class="dim">not surveyed</span>`;
       const sc = r.score;
       const score = sc ? `<span title="seconds of ads heard">${sc.ad_heard}s</span> / <span title="seconds of game muted">${sc.show_muted}s</span>` : "";
-      const act = r.job || r.recording ? "" : `<button data-survey="${esc(r.name)}">${r.surveyed ? "Survey again" : "Survey"}</button>`;
+      const act = (r.surveyed ? `<button data-details title="graphs, tuning and labels">Details</button> ` : "") +
+        (r.job || r.recording ? "" : `<button data-survey="${esc(r.name)}">${r.surveyed ? "Survey again" : "Survey"}</button>`);
       return `<tr class="click" data-open="${esc(r.name)}">
         <td><b>${esc(r.title)}</b><div class="dim hide-sm" style="font-size:12px">${esc(r.path)} · ${gb(r.size)}</div>
           <div class="dim show-sm" style="font-size:12px">${[r.length ? hms(r.length) : "", r.surveyed ? `${r.breaks} mutes` : "", r.label_count ? `${r.label_count} labels` : "", sc ? `heard ${sc.ad_heard}s · muted ${sc.show_muted}s` : ""].filter(Boolean).join(" · ")}</div>
@@ -102,11 +104,11 @@ async function listView() {
         <td class="num hide-sm">${r.length ? hms(r.length) : ""}</td>
         <td class="hide-sm">${status}</td>
         <td class="num hide-sm">${r.surveyed ? r.breaks : ""}</td>
-        <td class="hide-sm">${r.labelled ? `<span class="tag good">${r.label_count} ads, reviewed</span>` : r.label_count ? `<span class="tag">${r.label_count} ads, draft</span>` : ""}</td>
+        <td class="hide-sm">${r.surveyed ? (r.labelled ? `<span class="tag good">checked</span>` : `<span class="tag">${r.checked || 0} of ${r.breaks} checked</span>`) : ""}</td>
         <td class="num hide-sm">${score}</td>
         <td style="text-align:right">${act}</td></tr>`;
     }).join("");
-    $("#list").innerHTML = rows ? `<table><thead><tr><th>Recording</th><th class="num hide-sm">Length</th><th class="hide-sm">Status</th><th class="num hide-sm">Mutes</th><th class="hide-sm">Labels</th><th class="num hide-sm" title="ads heard / game muted, against the labels">Heard / muted</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+    $("#list").innerHTML = rows ? `<table><thead><tr><th>Recording</th><th class="num hide-sm">Length</th><th class="hide-sm">Status</th><th class="num hide-sm">Mutes</th><th class="hide-sm">Review</th><th class="num hide-sm" title="ads heard / game muted, against the labels">Heard / muted</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
       : `<div class="empty">No .ts recordings found.</div>`;
   };
   $("#list").addEventListener("click", async e => {
@@ -117,7 +119,7 @@ async function listView() {
       return;
     }
     const tr = e.target.closest("[data-open]");
-    if (tr) location.hash = "#/rec/" + encodeURIComponent(tr.dataset.open);
+    if (tr) location.hash = (e.target.closest("[data-details]") ? "#/rec/" : "#/review/") + encodeURIComponent(tr.dataset.open);
   });
   await draw();
   every(5000, draw);
@@ -534,7 +536,7 @@ async function recView(name) {
       <table><thead><tr><th>Start</th><th>End</th><th class="num">Length</th><th></th></tr></thead><tbody>`;
     html += v.map(({ s, e, ok }, i) => `<tr class="click" data-seek="${s - 8}" data-zoom="${s},${e}">
       <td class="t">${hms(s)}</td><td class="t">${hms(e)}</td><td class="num">${dur(e - s)}</td>
-      <td>${ok === null ? "" : ok ? `<span class="tag good">ad</span>` : `<span class="tag bad">game muted</span>`}</td></tr>`).join("");
+      <td>${ok === null ? "" : ok ? `<span class="tag good">ad</span>` : `<span class="tag bad">game muted</span> <button data-act="label-break" data-span="${s},${e}" title="it was an ad after all: add it to the labels">Label as ad</button>`}</td></tr>`).join("");
     html += `</tbody></table>`;
     if (labelled) {
       const rows = adRows(breaks).filter(r => r.cov < 0.5 || r.heardStart > 1 || r.heardEnd > 1);
@@ -635,7 +637,7 @@ async function recView(name) {
 
   const panel = $("#panel");
   panel.addEventListener("click", async e => {
-    const el = e.target.closest("[data-act],[data-seek],[data-del],[data-play],[data-sbs],[data-label]");
+    const el = e.target.closest("[data-act=label-break],[data-act],[data-seek],[data-del],[data-play],[data-sbs],[data-label]");
     if (!el) return;
     if (el.dataset.seek !== undefined) {
       const [s, en] = el.dataset.zoom.split(",").map(Number);
@@ -650,6 +652,11 @@ async function recView(name) {
     if (el.dataset.play !== undefined) { const [s, en] = R.labels.ads[Number(el.dataset.play)]; R.sel = Number(el.dataset.play); zoomTo(s - 60, en + 60); seek(s - 5); renderPanel(); return; }
     if (el.dataset.label !== undefined && e.target.tagName !== "INPUT") { R.sel = Number(el.dataset.label); renderPanel(); draw(); return; }
     const act = el.dataset.act;
+    if (act === "label-break") {
+      const [s, en] = el.dataset.span.split(",").map(Number);
+      R.labels.ads.push([Math.round(s), Math.round(en)]);
+      labelsChanged(); toast(`Labelled ${hms(s)} – ${hms(en)} as an ad`); return;
+    }
     if (act === "add-label") { const t = Math.round(now()); addLabel([t, t + 30]); }
     else if (act === "copy-labels") { R.labels.ads = R.survey.map(([s, en]) => [Math.round(s), Math.round(en)]); R.tab = "labels"; labelsChanged(); }
     else if (act === "reset") { R.settings = { ...META.defaults }; renderPanel(); runSim(); draw(); }
@@ -716,6 +723,222 @@ async function recView(name) {
 
   cleanup = () => { cancelAnimationFrame(raf); document.removeEventListener("keydown", onKey); window.removeEventListener("resize", draw); vid.pause(); vid.removeAttribute("src"); vid.load(); };
   renderPanel(); draw();
+}
+
+
+// ---------- review: one mute at a time ----------
+async function reviewView(name) {
+  main.innerHTML = `<div class="empty">Loading…</div>`;
+  const d = await api("api/rec/" + encodeURIComponent(name));
+  if (!d.result) {
+    main.innerHTML = `<a href="#/" class="dim">← Recordings</a><div class="card empty" style="margin-top:12px">This game hasn't been surveyed yet. <a href="#/rec/${encodeURIComponent(name)}">Open Details</a> to start one.</div>`;
+    return;
+  }
+  const L = d.labels; L.review = L.review || {};
+  const mutes = d.result.breaks.map(([s, e]) => ({ s, e, key: String(Math.floor(s)) }));
+  const len = d.result.length;
+  // answers saved under a slightly different start (a newer survey) still count
+  for (const m of mutes) if (!L.review[m.key]) {
+    const near = Object.keys(L.review).find(k => Math.abs(Number(k) - m.s) <= 3);
+    if (near) { L.review[m.key] = L.review[near]; delete L.review[near]; }
+  }
+  const S = { i: Math.max(0, mutes.findIndex(m => !L.review[m.key])), mode: "mutes", edit: null, base: 0, h: 720 };
+  if (S.i < 0 || mutes.every(m => L.review[m.key])) S.i = mutes.length ? mutes.length - 1 : 0;
+
+  main.innerHTML = `<div id="rv">
+    <div class="rv-head"><a href="#/" class="dim">← Recordings</a><a href="#/rec/${encodeURIComponent(name)}" class="dim">Details →</a></div>
+    <h1 class="rv-title">${esc(d.title)}</h1>
+    <div class="rv-progress"><div class="bar"><i id="pbar"></i></div><span id="ptext"></span></div>
+    <div class="rv-tabs"><button data-mode="mutes">1. Check the mutes</button><button data-mode="missed">2. Look for missed ads</button></div>
+    <div class="rv-grid">
+      <div>
+        <div class="player"><video id="rvid" playsinline></video><div class="badge" id="rbadge">sound on</div><div class="clock" id="rclock"></div></div>
+        <div id="rbars"></div>
+        <p class="dim rv-hint">Red is what gets muted. Tap a bar to jump there.</p>
+      </div>
+      <div id="rpanel" class="card"></div>
+    </div></div>`;
+  const vid = $("#rvid");
+  const now = () => S.base + (vid.currentTime || 0);
+  function seek(t, play = true) {
+    t = clamp(t, 0, len);
+    const rel = t - S.base, b = vid.buffered;
+    if (vid.currentSrc && rel >= 0 && b.length && rel <= b.end(b.length - 1) + 0.5) vid.currentTime = rel;
+    else { S.base = t; vid.src = `api/rec/${encodeURIComponent(name)}/video?t=${t.toFixed(1)}&h=${S.h}`; }
+    if (play) vid.play().catch(() => {});
+  }
+
+  // what's muted while playing: the current mute as the detector did it, or your edit of it
+  const span = () => S.edit || (S.mode === "mutes" && mutes[S.i] ? [mutes[S.i].s, mutes[S.i].e] : null);
+  let raf;
+  const loop = () => {
+    const t = now(), sp = span();
+    const m = !!(vid.currentSrc && sp && t >= sp[0] && t < sp[1]);
+    vid.muted = m;
+    $("#rbadge").textContent = m ? "MUTED" : "sound on"; $("#rbadge").classList.toggle("muted", m);
+    $("#rclock").textContent = vid.currentSrc ? hms(t) : "";
+    drawBars(); raf = requestAnimationFrame(loop);
+  };
+
+  // two short bars: around where the mute starts, and around where it ends
+  function drawBars() {
+    const el = $("#rbars"), sp = span();
+    if (!sp) { if (el._key) { el.innerHTML = ""; el._key = ""; } return; }
+    const pct = (x, a) => clamp((x - a) / 20 * 100, 0, 100);
+    const key = sp.join(",");
+    if (el._key !== key) {  // rebuild only when the mute (or your edit of it) changes
+      const bar = (label, mid, which) => {
+        const a = mid - 10, ms = pct(sp[0], a), me = pct(sp[1], a);
+        return `<div class="rbar"><span class="rbar-label">${label}</span><div class="rbar-track" data-bar="${which}" data-a="${a}">
+          <i class="mut" style="left:${ms}%;width:${Math.max(0, me - ms)}%"></i><i class="ph" hidden></i></div>
+          <button data-jump="${which}">▶ play</button></div>`;
+      };
+      el.innerHTML = bar(`start ${hms(sp[0])}`, sp[0], "start") + (sp[1] - sp[0] > 25 ? bar(`end ${hms(sp[1])}`, sp[1], "end") : "");
+      el._key = key;
+    }
+    const t = now();
+    el.querySelectorAll(".rbar-track").forEach(tr => {
+      const a = Number(tr.dataset.a), ph = tr.querySelector(".ph");
+      const on = !!vid.currentSrc && t >= a && t <= a + 20;
+      ph.hidden = !on;
+      if (on) ph.style.left = pct(t, a) + "%";
+    });
+  }
+  $("#rbars").addEventListener("click", e => {
+    const j = e.target.closest("[data-jump]"), tr = e.target.closest("[data-bar]");
+    const sp = span(); if (!sp) return;
+    if (j) seek((j.dataset.jump === "start" ? sp[0] : sp[1]) - 6);
+    else if (tr) { const r = tr.getBoundingClientRect(); seek(Number(tr.dataset.a) + (e.clientX - r.left) / r.width * 20); }
+  });
+
+  // ----- saving: answers become the labels -----
+  const save = debounce(async () => {
+    L.reviewed = mutes.length > 0 && mutes.every(m => L.review[m.key]);
+    try { await api(`api/rec/${encodeURIComponent(name)}/labels`, { json: L }); } catch (e) { toast("Couldn't save: " + e.message); }
+  }, 300);
+  const overlaps = (a, s, e) => a[1] > s && a[0] < e;
+  function answer(verdict, sp) {
+    const m = mutes[S.i];
+    const keepSbs = L.ads.some(a => a[2] === "sbs" && overlaps(a, m.s, m.e));
+    L.ads = L.ads.filter(a => !overlaps(a, m.s, m.e) && !(sp && overlaps(a, sp[0], sp[1])));
+    if (verdict === "right") L.ads.push([Math.round(m.s), Math.round(m.e)].concat(keepSbs ? ["sbs"] : []));
+    if (verdict === "partly") L.ads.push([Math.round(sp[0]), Math.round(sp[1])].concat(keepSbs ? ["sbs"] : []));
+    L.ads.sort((a, b) => a[0] - b[0]);
+    L.review[m.key] = verdict === "partly" ? { verdict, span: sp } : { verdict };
+    S.edit = null;
+    save(); progress();
+    next();
+  }
+  function next() {
+    const after = mutes.findIndex((m, i) => i > S.i && !L.review[m.key]);
+    const any = mutes.findIndex(m => !L.review[m.key]);
+    if (after >= 0) go(after);
+    else if (any >= 0) go(any);
+    else { S.i = mutes.length; vid.pause(); render(); }
+  }
+  function go(i) { S.i = i; S.edit = null; render(); const m = mutes[i]; if (m) seek(m.s - 5); }
+  function progress() {
+    const done = mutes.filter(m => L.review[m.key]).length, wrong = mutes.filter(m => L.review[m.key]?.verdict === "wrong").length;
+    $("#pbar").style.width = (mutes.length ? done / mutes.length * 100 : 100) + "%";
+    $("#ptext").textContent = `${done} of ${mutes.length} mutes checked` + (wrong ? ` · ${wrong} ${wrong === 1 ? "was" : "were"} the game` : "") + (L.missed_checked ? " · missed ads checked" : "");
+  }
+
+  // ----- the right-hand panel -----
+  function render() {
+    document.querySelectorAll(".rv-tabs button").forEach(b => b.classList.toggle("on", b.dataset.mode === S.mode));
+    const p = $("#rpanel");
+    if (S.mode === "missed") return renderMissed(p);
+    const m = mutes[S.i];
+    if (!m) {
+      p.innerHTML = `<h2>All mutes checked 🎉</h2><p>Thanks! ${mutes.filter(x => L.review[x.key]?.verdict === "wrong").length} of ${mutes.length} were the game, not ads.</p>
+        <p>Next, step 2 finds ads the detector didn't mute at all.</p><button class="big primary" data-mode="missed">Look for missed ads</button>
+        <p class="dim" style="margin-top:14px"><button class="link" data-goto="0">Go back through the mutes</button></p>`;
+      return;
+    }
+    const prev = L.review[m.key];
+    const sp = S.edit;
+    p.innerHTML = `
+      <div class="rv-count">Mute ${S.i + 1} of ${mutes.length}${prev ? ` · you said <b>${{ right: "right", wrong: "game", partly: "partly" }[prev.verdict]}</b>` : ""}</div>
+      <div class="rv-when">${hms(m.s)} – ${hms(m.e)} <span class="dim">(${dur(m.e - m.s)} muted)</span></div>
+      <p class="dim">Watch from just before. Was it right to mute this?</p>
+      ${sp ? `
+        <div class="rv-edit">
+          <p><b>Fix the timing.</b> While watching, press when the ad really started and when the game really came back.</p>
+          <div class="rv-edit-row"><button class="big" data-set="0">Ad started here</button><span class="t">${hms(sp[0])}</span><button data-nudge="0,-1">−1s</button><button data-nudge="0,1">+1s</button></div>
+          <div class="rv-edit-row"><button class="big" data-set="1">Game back here</button><span class="t">${hms(sp[1])}</span><button data-nudge="1,-1">−1s</button><button data-nudge="1,1">+1s</button></div>
+          <div class="rv-actions"><button class="big primary" data-save>Save</button><button class="big" data-cancel-edit>Cancel</button></div>
+        </div>` : `
+        <div class="rv-answers">
+          <button class="big good" data-ans="right"><b>✓ Right</b><span>it was an ad</span></button>
+          <button class="big bad" data-ans="wrong"><b>✗ Wrong</b><span>it was the game</span></button>
+          <button class="big" data-ans="partly"><b>◐ Partly</b><span>right, but starts or ends at the wrong time</span></button>
+        </div>`}
+      <div class="rv-nav"><button data-prev>← Back</button><button data-replay class="primary">▶ Play from just before</button><button data-skip>Skip →</button></div>
+      <p class="dim rv-keys hide-sm">Keys: <span class="kbd">1</span> right · <span class="kbd">2</span> wrong · <span class="kbd">3</span> partly · <span class="kbd">space</span> play/pause · <span class="kbd">←</span><span class="kbd">→</span> 5 s</p>`;
+  }
+
+  // ----- step 2: missed ads, as thumbnails of everything that wasn't muted -----
+  function renderMissed(p) {
+    const gaps = [];
+    let t = 0;
+    for (const m of mutes) { if (m.s - t > 20) gaps.push([t, m.s]); t = Math.max(t, m.e); }
+    if (len - t > 20) gaps.push([t, len]);
+    const thumbs = [];
+    for (const [a, z] of gaps) for (let x = Math.ceil(a / 10) * 10 + 10; x < z - 5; x += 10) {
+      if (L.ads.some(ad => x >= ad[0] && x < ad[1])) continue;
+      const sheet = Math.floor(x / 600) + 1, tile = Math.floor((x % 600) / 10);
+      thumbs.push(`<button class="th" data-t="${x}" title="${hms(x)}" style="background-image:url('api/rec/${encodeURIComponent(name)}/sheet/${sheet}.jpg');background-position:${(tile % 6) * 20}% ${Math.floor(tile / 6) * 100 / 9}%"></button>`);
+    }
+    p.innerHTML = S.edit ? `
+      <h2>Mark the missed ad</h2>
+      <p>Play it and press when the ad started and when the game came back.</p>
+      <div class="rv-edit-row"><button class="big" data-set="0">Ad started here</button><span class="t">${hms(S.edit[0])}</span><button data-nudge="0,-1">−1s</button><button data-nudge="0,1">+1s</button></div>
+      <div class="rv-edit-row"><button class="big" data-set="1">Game back here</button><span class="t">${hms(S.edit[1])}</span><button data-nudge="1,-1">−1s</button><button data-nudge="1,1">+1s</button></div>
+      <div class="rv-actions"><button class="big primary" data-save-missed>Save ad</button><button class="big" data-cancel-edit>Cancel</button></div>`
+      : `<h2>Anything the detector didn't mute?</h2>
+      <p class="dim">One picture every 10 seconds of everything that played with sound. Scroll through and tap any that look like an ad to check it.</p>
+      <div class="rv-thumbs">${thumbs.join("") || `<p class="dim">Nothing unmuted to check.</p>`}</div>
+      <div class="rv-actions"><button class="big primary" data-missed-done>${L.missed_checked ? "✓ Checked" : "Done: no more missed ads"}</button></div>
+      <div id="missed-pick"></div>`;
+  }
+
+  // ----- events -----
+  const panel = $("#rpanel");
+  $("#rv").addEventListener("click", e => {
+    const b = e.target.closest("button"); if (!b) return;
+    if (b.dataset.mode) { S.mode = b.dataset.mode; S.edit = null; render(); if (S.mode === "mutes" && mutes[S.i]) seek(mutes[S.i].s - 5, false); return; }
+    if (b.dataset.goto) return go(Number(b.dataset.goto));
+    if (b.dataset.ans === "right" || b.dataset.ans === "wrong") return answer(b.dataset.ans);
+    if (b.dataset.ans === "partly") { const m = mutes[S.i]; S.edit = [m.s, m.e]; render(); return; }
+    if (b.dataset.set !== undefined) { S.edit[Number(b.dataset.set)] = Math.round(now()); if (S.edit[1] <= S.edit[0]) S.edit[1] = S.edit[0] + 5; render(); return; }
+    if (b.dataset.nudge) { const [k, dv] = b.dataset.nudge.split(",").map(Number); S.edit[k] += dv; render(); return; }
+    if (b.hasAttribute("data-save")) return answer("partly", S.edit.slice());
+    if (b.hasAttribute("data-cancel-edit")) { S.edit = null; render(); return; }
+    if (b.hasAttribute("data-prev")) return go(Math.max(0, S.i - 1));
+    if (b.hasAttribute("data-skip")) return go(Math.min(mutes.length - 1, S.i + 1));
+    if (b.hasAttribute("data-replay")) { const sp = span(); if (sp) seek(sp[0] - 5); return; }
+    if (b.dataset.t) { const t = Number(b.dataset.t); seek(t - 3); S.pick = t;
+      $("#missed-pick").innerHTML = `<div class="rv-pick">Playing ${hms(t)}. <button class="primary" data-mark>It's an ad</button></div>`; return; }
+    if (b.hasAttribute("data-mark")) { S.edit = [Math.round(S.pick - 3), Math.round(S.pick + 30)]; render(); return; }
+    if (b.hasAttribute("data-save-missed")) {
+      L.ads = L.ads.filter(a => !overlaps(a, S.edit[0], S.edit[1])).concat([S.edit.map(Math.round)]).sort((a, b) => a[0] - b[0]);
+      S.edit = null; save(); toast("Saved the missed ad"); render(); return;
+    }
+    if (b.hasAttribute("data-missed-done")) { L.missed_checked = true; save(); progress(); render(); toast("Thanks! This game is done."); }
+  });
+  const onKey = e => {
+    if (e.target.closest("input, textarea, select")) return;
+    if (e.key === " ") { e.preventDefault(); vid.paused ? vid.play() : vid.pause(); }
+    else if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); seek(now() + (e.key === "ArrowLeft" ? -5 : 5), !vid.paused); }
+    else if (S.mode === "mutes" && !S.edit && mutes[S.i]) {
+      if (e.key === "1") answer("right"); else if (e.key === "2") answer("wrong");
+      else if (e.key === "3") { S.edit = [mutes[S.i].s, mutes[S.i].e]; render(); }
+    }
+  };
+  document.addEventListener("keydown", onKey);
+  cleanup = () => { cancelAnimationFrame(raf); document.removeEventListener("keydown", onKey); vid.pause(); vid.removeAttribute("src"); vid.load(); };
+  progress(); render(); loop();
+  if (mutes[S.i]) seek(mutes[S.i].s - 5, false);
 }
 
 // ---------- live ----------

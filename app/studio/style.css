@@ -121,6 +121,54 @@ pre.log { background: var(--panel2); padding: 10px; border-radius: 6px; font-siz
 .meter { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-top: 3px; }
 .meter i { display: block; height: 100%; background: var(--g0); }
 img.logo { width: 100%; image-rendering: pixelated; border-radius: 6px; background: #000; }
+/* review */
+.rv-head { display: flex; justify-content: space-between; margin-bottom: 4px; }
+.rv-head a { text-decoration: none; }
+.rv-title { margin-bottom: 10px; }
+.rv-progress { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; color: var(--dim); font-size: 13px; }
+.rv-progress .bar { flex: 0 0 220px; height: 8px; border-radius: 4px; background: var(--panel2); overflow: hidden; }
+.rv-progress .bar i { display: block; height: 100%; background: var(--good); transition: width .3s; }
+.rv-tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+.rv-tabs button { border-radius: 18px; padding: 6px 14px; }
+.rv-tabs button.on { background: var(--text); color: var(--bg); border-color: var(--text); }
+.rv-grid { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 16px; align-items: start; }
+@media (max-width: 1000px) { .rv-grid { grid-template-columns: 1fr; } }
+.rv-grid .player { width: 100%; }
+.rv-count { color: var(--dim); font-size: 13px; }
+.rv-when { font-size: 22px; font-family: var(--mono); margin: 2px 0 4px; }
+.rv-answers { display: grid; gap: 8px; margin: 12px 0; }
+button.big { padding: 12px 14px; font-size: 15px; border-radius: 10px; text-align: left; }
+button.big b { display: block; font-size: 17px; }
+button.big span { font-size: 13px; color: var(--dim); }
+button.big.good { border-color: var(--good); } button.big.good b { color: var(--good); }
+button.big.bad { border-color: var(--bad); } button.big.bad b { color: var(--bad); }
+button.big.primary span { color: inherit; }
+button.link { background: none; border: none; padding: 0; text-decoration: underline; color: var(--dim); }
+.rv-nav { display: flex; gap: 6px; justify-content: space-between; margin-top: 6px; }
+.rv-keys { font-size: 12px; margin: 10px 0 0; }
+.rv-edit { background: var(--panel2); border-radius: 10px; padding: 10px; margin: 10px 0; }
+.rv-edit p { margin: 0 0 8px; }
+.rv-edit-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
+.rv-edit-row .big { flex: 1; min-width: 150px; text-align: center; }
+.rv-edit-row .t { font-family: var(--mono); min-width: 64px; text-align: center; }
+.rv-actions { display: flex; gap: 8px; margin-top: 10px; }
+.rv-actions .big { flex: 1; text-align: center; }
+.rbar { display: grid; grid-template-columns: 110px 1fr auto; gap: 8px; align-items: center; margin-top: 8px; font-size: 12px; color: var(--dim); }
+.rbar-track { position: relative; height: 22px; background: var(--panel2); border-radius: 6px; overflow: hidden; cursor: pointer; }
+.rbar-track .mut { position: absolute; top: 0; bottom: 0; background: var(--survey); opacity: .55; }
+.rbar-track .ph { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--text); }
+.rbar button { padding: 3px 9px; font-size: 12px; }
+.rv-hint { font-size: 12px; margin: 6px 0 0; }
+.rv-thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 4px; max-height: 60vh; overflow: auto; margin: 8px 0; }
+.rv-thumbs .th { aspect-ratio: 16/9; padding: 0; border: none; border-radius: 4px; background-size: 600% 1000%; background-color: #000; position: relative; }
+.rv-thumbs .th span { position: absolute; left: 3px; bottom: 2px; font-size: 10px; color: #fff; background: rgba(0,0,0,.6); padding: 0 3px; border-radius: 3px; font-family: var(--mono); }
+.rv-pick { position: sticky; bottom: 0; background: var(--panel); padding: 8px 0; display: flex; align-items: center; gap: 8px; }
+@media (max-width: 700px) {
+  .rv-progress .bar { flex-basis: 120px; }
+  .rv-when { font-size: 18px; }
+  .rbar { grid-template-columns: 1fr auto; }
+  .rbar-label { grid-column: 1 / -1; }
+}
 #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 8px; z-index: 9; }
 @media (max-width: 700px) {
   header { gap: 6px; padding: 8px 10px; }

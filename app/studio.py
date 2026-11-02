@@ -71,7 +71,8 @@ def recordings():
         r = {"name": name, "title": p.stem, "path": str(p.relative_to(RECORDINGS)), "size": st.st_size,
              "modified": st.st_mtime, "recording": time.time() - st.st_mtime < 120,
              "surveyed": res is not None, "labelled": bool(labels.get("ads")) and labels.get("reviewed", False),
-             "label_count": len(labels.get("ads", [])), "job": JOBS.active_for(name)}
+             "label_count": len(labels.get("ads", [])), "job": JOBS.active_for(name),
+             "checked": len(labels.get("review") or {}), "missed_checked": bool(labels.get("missed_checked"))}
         if res:
             r.update(length=res["length"], breaks=len(res["breaks"]), graphics=res.get("graphics"),
                      surveyed_at=res.get("finished"))
@@ -500,8 +501,16 @@ class Handler(BaseHTTPRequestHandler):
             if m and find(m.group(1)) is not None:
                 ads = merged([[float(a[0]), float(a[1])] + (["sbs"] if len(a) > 2 and a[2] == "sbs" else [])
                               for a in req.get("ads", []) if float(a[1]) > float(a[0]) >= 0])
+                # Review mode's answers per mute (keyed by the mute's start second), kept so the
+                # review can pick up where it left off.
+                review = {}
+                for k, v in (req.get("review") or {}).items():
+                    if isinstance(v, dict) and v.get("verdict") in ("right", "wrong", "partly"):
+                        span = v.get("span")
+                        review[str(int(float(k)))] = {"verdict": v["verdict"], **(
+                            {"span": [float(span[0]), float(span[1])]} if isinstance(span, list) and len(span) == 2 else {})}
                 labels = {"ads": ads, "reviewed": bool(req.get("reviewed")), "notes": str(req.get("notes", ""))[:5000],
-                          "updated": time.time()}
+                          "review": review, "missed_checked": bool(req.get("missed_checked")), "updated": time.time()}
                 f = REPLAY / m.group(1) / "labels.json"
                 f.parent.mkdir(parents=True, exist_ok=True)
                 tmp = f.with_suffix(".tmp")

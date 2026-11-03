@@ -74,6 +74,7 @@ function route() {
   if (view === "rec" && arg) return recView(decodeURIComponent(arg));
   if (view === "review" && arg) return reviewView(decodeURIComponent(arg));
   if (view === "live") return liveView();
+  if (view === "sounds") return soundsView();
   if (view === "jobs") return jobsView();
   return listView();
 }
@@ -1004,6 +1005,95 @@ async function liveView() {
   };
   await draw();
   every(3000, draw);
+}
+
+// ---------- sounds: sponsor reads and repeated sounds ----------
+const SOUND_KINDS = { jingle: "Jingle (break edge)", closer: "Network promo (ends breaks)", ad: "Ad", program: "Part of the game", ignore: "Not useful" };
+async function soundsView() {
+  main.innerHTML = `<h1>Sounds</h1>
+    <div class="sub">What the commentary says, and sounds that come back. Sponsor reads would be muted while the picture plays on;
+      jingles and network promos mark where breaks start and end. Confirm what each one is.</div>
+    <div class="sounds-top"><div class="player"><video id="svid" playsinline controls></video><div class="clock" id="sclock"></div>
+      <div class="hint" id="shint">Press ▶ on a row to hear it</div></div><div class="dim" id="snow" style="font-size:12px;margin-top:4px"></div></div>
+    <div id="sbody"><div class="card empty">Loading…</div></div>`;
+  const vid = $("#svid"), st = { h: 540, base: 0, name: null };
+  let D = null, open = new Set(), filter = "read";
+  try { filter = localStorage.getItem("studio.readfilter") || "read"; } catch (e) { /* no storage */ }
+  const play = (name, t, what) => {
+    if (st.name !== name) { st.name = name; st.src = null; st.base = -1e9; vid.removeAttribute("src"); vid.load(); }
+    $("#shint").hidden = true;
+    $("#snow").textContent = what || "";
+    seekVideo(vid, st, name, Math.max(0, t));
+    vid.play().catch(() => {});
+  };
+  every(250, () => { if (st.name) $("#sclock").textContent = hms(st.base + (vid.currentTime || 0)); });
+  const verdict = k => D.verdicts[k]?.value || "";
+  const draw = () => {
+    const recs = D.recordings, listened = recs.filter(r => r.listened);
+    const busy = recs.some(r => r.job);
+    let html = `<div class="card" style="margin-top:14px"><h2>Recordings</h2><table><tbody>${recs.map(r => `<tr>
+        <td>${esc(r.title)}</td>
+        <td>${r.job ? `<span class="tag warn">${esc(r.job.progress || r.job.what)}</span>` : r.listened ? `<span class="tag good">listened</span>` : `<span class="dim">not yet</span>`}</td>
+        <td style="text-align:right">${r.job ? "" : `<button data-listen="${esc(r.name)}">${r.listened ? "Listen again" : "Listen"}</button>`}</td></tr>`).join("")}</tbody></table>
+      <div class="row"><button class="primary" data-find ${listened.length && !busy ? "" : "disabled"}>Find reads and repeated sounds</button>
+        <span class="dim" style="font-size:12px">${D.found ? `last run ${ago(D.found)}` : "not run yet"} · listening takes about 4 min per game (GPU)</span></div></div>`;
+    // sponsor reads
+    const rows = [];
+    for (const r of recs) for (const x of r.reads) {
+      const key = `read:${r.name}@${Math.round(x.start)}`, v = verdict(key);
+      if (filter === "read" && x.kind !== "read" && !v) continue;
+      rows.push(`<tr><td class="mono" style="white-space:nowrap">${hms(x.start)}</td>
+        <td><span class="tag ${x.kind === "read" ? "warn" : ""}">${x.kind === "read" ? "would mute" : x.kind === "mention" ? "short mention" : "brand-named segment"}</span>
+          <div class="dim" style="font-size:12px">${esc(r.title.replace(/^NFL Football\s*/, ""))}</div></td>
+        <td title="${esc(x.context)}">“${esc(x.text)}” <span class="dim">${(x.end - x.start).toFixed(1)}s</span></td>
+        <td style="white-space:nowrap"><button data-play="${esc(r.name)}" data-t="${x.start - 4}" data-what="${esc(x.text)}">▶</button>
+          <button data-verdict="${esc(key)}" data-value="mute" class="${v === "mute" ? "primary" : ""}" title="an ad read: mute it">Mute</button>
+          <button data-verdict="${esc(key)}" data-value="keep" class="${v === "keep" ? "primary" : ""}" title="fine to hear">Keep</button></td></tr>`);
+    }
+    const nReads = recs.reduce((n, r) => n + r.reads.length, 0);
+    html += `<div class="card" style="margin-top:14px"><h2>Sponsor reads</h2>
+      <div class="row"><label><input type="radio" name="rf" value="read" ${filter === "read" ? "checked" : ""}> ones it would mute</label>
+        <label><input type="radio" name="rf" value="all" ${filter === "all" ? "checked" : ""}> also short mentions and brand-named segments (left on)</label></div>
+      ${rows.length ? `<table><tbody>${rows.join("")}</tbody></table>` : `<p class="dim">${nReads ? "None to show." : "Listen to a recording, then Find reads."}</p>`}</div>`;
+    // repeated sounds
+    const snd = D.sounds;
+    html += `<div class="card" style="margin-top:14px"><h2>Repeated sounds</h2>
+      <p class="dim" style="font-size:12px">Sounds heard more than once, most often first, with a guess from where they fall against the ads. ▶ plays each place it was heard.</p>
+      ${snd.length ? `<table><tbody>${snd.map(x => {
+        const key = `sound:${x.id}`, v = verdict(key);
+        return `<tr><td style="white-space:nowrap"><button data-open="${esc(x.id)}">${open.has(x.id) ? "▾" : "▸"}</button></td>
+          <td><span class="tag">${esc(SOUND_KINDS[x.guess] || x.guess)}?</span> <span class="dim">${x.places.length}× in ${x.recordings} rec · ${x.length}s</span>
+            <div style="font-size:13px">${x.text ? `“${esc(x.text.slice(0, 160))}”` : `<span class="dim">no words (music?)</span>`}</div>
+            ${open.has(x.id) ? `<div class="row">${x.places.map(p => `<button data-play="${esc(p.name)}" data-t="${p.start - 3}" data-what="${esc(SOUND_KINDS[x.guess] || x.guess)}: ${hms(p.start)}–${hms(p.end)} (${esc(p.where)})">▶ ${hms(p.start)} <span class="dim">${esc(p.where)}</span></button>`).join("")}</div>` : ""}</td>
+          <td><select data-sound="${esc(key)}"><option value="">What is it?</option>${Object.entries(SOUND_KINDS).map(([k, l]) => `<option value="${k}" ${v === k ? "selected" : ""}>${l}</option>`).join("")}</select></td></tr>`;
+      }).join("")}</tbody></table>` : `<p class="dim">Nothing yet.</p>`}</div>`;
+    $("#sbody").innerHTML = html;
+  };
+  const load = async () => { D = await api("api/sounds"); draw(); };
+  $("#sbody").addEventListener("click", async e => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    try {
+      if (b.dataset.listen) { await api("api/jobs", { json: { kind: "listen", name: b.dataset.listen } }); toast("Listening started"); await load(); }
+      else if (b.hasAttribute("data-find")) { await api("api/jobs", { json: { kind: "sounds", name: "" } }); toast("Started: see Jobs"); }
+      else if (b.dataset.play) play(b.dataset.play, +b.dataset.t, b.dataset.what);
+      else if (b.dataset.open) { open.has(b.dataset.open) ? open.delete(b.dataset.open) : open.add(b.dataset.open); draw(); }
+      else if (b.dataset.verdict) {
+        const same = verdict(b.dataset.verdict) === b.dataset.value;
+        D.verdicts = await api("api/sounds/verdict", { json: { key: b.dataset.verdict, value: same ? "" : b.dataset.value } }); draw();
+      }
+    } catch (err) { toast(err.message); }
+  });
+  $("#sbody").addEventListener("change", async e => {
+    if (e.target.name === "rf") { filter = e.target.value; try { localStorage.setItem("studio.readfilter", filter); } catch (x) { /* no storage */ } draw(); }
+    if (e.target.dataset.sound) {
+      try { D.verdicts = await api("api/sounds/verdict", { json: { key: e.target.dataset.sound, value: e.target.value } }); toast("Saved"); }
+      catch (err) { toast(err.message); }
+    }
+  });
+  cleanup = () => { vid.pause(); vid.removeAttribute("src"); vid.load(); };
+  await load();
+  every(5000, async () => { if (D.recordings.some(r => r.job)) await load(); });
 }
 
 // ---------- jobs ----------

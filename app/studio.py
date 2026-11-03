@@ -7,6 +7,8 @@
 - Tuning: replays a survey's saved trace with other settings in about a second, no video
   decoding, and scores the result on every labelled recording.
 - Live: what the admute proxy is doing right now.
+- Sounds: sponsor reads found in the commentary and sounds that repeat across recordings
+  (jingles, network promos, ads), to confirm what each one is.
 
 Sign-in is formlogin (password in /data/studio/login.json, set with python -m formlogin passwd). Everything machine-specific
 comes from the environment set in docker-compose.yaml.
@@ -74,7 +76,8 @@ def recordings():
              "modified": st.st_mtime, "recording": time.time() - st.st_mtime < 120,
              "surveyed": res is not None, "labelled": bool(labels.get("ads")) and labels.get("reviewed", False),
              "label_count": len(labels.get("ads", [])), "job": JOBS.active_for(name),
-             "checked": len(labels.get("review") or {}), "missed_checked": bool(labels.get("missed_checked"))}
+             "checked": len(labels.get("review") or {}), "missed_checked": bool(labels.get("missed_checked")),
+             "listened": (work / "speech.json").exists()}
         if res:
             r.update(length=res["length"], breaks=len(res["breaks"]), graphics=res.get("graphics"),
                      surveyed_at=res.get("finished"))
@@ -250,6 +253,47 @@ def layouts():
     return out
 
 
+# --- sounds: sponsor reads and repeated sounds -----------------------------------------
+
+SOUNDS = REPLAY.parent / "sounds"
+READ_VERDICTS = ("mute", "keep")
+SOUND_VERDICTS = ("jingle", "closer", "ad", "program", "ignore")
+
+
+def sounds_page():
+    verdicts = read_json(SOUNDS / "verdicts.json") or {}
+    recs = []
+    for r in recordings():
+        reads = (read_json(REPLAY / r["name"] / "reads.json") or {}).get("reads", [])
+        recs.append({"name": r["name"], "title": r["title"], "listened": r["listened"], "job": r["job"],
+                     "reads": reads})
+    found = read_json(SOUNDS / "sounds.json") or {}
+    return {"recordings": recs, "sounds": found.get("sounds", []), "found": found.get("found"),
+            "verdicts": verdicts}
+
+
+def set_verdict(key, value):
+    """key: "read:<recording>@<second>" or "sound:<id>"; value "" clears it."""
+    kind, _, rest = str(key).partition(":")
+    allowed = READ_VERDICTS if kind == "read" else SOUND_VERDICTS if kind == "sound" else ()
+    if not rest or (value and value not in allowed):
+        raise ValueError("bad verdict")
+    verdicts = read_json(SOUNDS / "verdicts.json") or {}
+    if value:
+        verdicts[key] = {"value": value, "at": time.time()}
+        if kind == "sound":  # where it was heard, so the verdict can follow it if ids change
+            for snd in (read_json(SOUNDS / "sounds.json") or {}).get("sounds", []):
+                if snd["id"] == rest:
+                    verdicts[key]["places"] = snd["places"]
+    else:
+        verdicts.pop(key, None)
+    SOUNDS.mkdir(parents=True, exist_ok=True)
+    tmp = SOUNDS / "verdicts.tmp"
+    tmp.write_text(json.dumps(verdicts, indent=1))
+    os.replace(tmp, SOUNDS / "verdicts.json")
+    return verdicts
+
+
 # --- jobs ------------------------------------------------------------------------
 
 class Jobs:
@@ -260,13 +304,19 @@ class Jobs:
         (STATE / "jobs").mkdir(parents=True, exist_ok=True)
 
     def start(self, kind, name, **kw):
-        whole = kind in ("layouts", "train")  # jobs about all recordings, not one
+        whole = kind in ("layouts", "train", "sounds")  # jobs about all recordings, not one
         path = None if whole else find(name)
         if path is None and not whole:
             raise ValueError("no such recording")
         if whole and any(j["kind"] == kind and j["state"] == "running" for j in self.jobs):
             raise ValueError("that's already running")
-        if kind == "survey":
+        if kind in ("survey", "listen") and self.active_for(name):
+            raise ValueError("a job is already running for this recording")
+        if kind == "listen":
+            args, what = ["listen", str(path)], "Listen (speech + fingerprints)"
+        elif kind == "sounds":
+            args, what = ["sounds"], "Find sponsor reads and repeated sounds"
+        elif kind == "survey":
             if self.active_for(name):
                 raise ValueError("a job is already running for this recording")
             args = ["survey", str(path)] + (["--fresh"] if kw.get("fresh") else [])
@@ -553,6 +603,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, live())
         if path == "/api/layouts":
             return self.send(200, layouts())
+        if path == "/api/sounds":
+            return self.send(200, sounds_page())
         if path == "/api/scene":
             from scene import Classifier
             c = Classifier.load()
@@ -660,6 +712,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/jobs":
                 return self.send(200, JOBS.start(req.get("kind"), str(req.get("name")), **{
                     k: req[k] for k in ("fresh", "start", "length", "settings") if k in req}))
+            if path == "/api/sounds/verdict":
+                return self.send(200, set_verdict(req.get("key"), str(req.get("value") or "")))
             if path == "/api/jobs/stop":
                 return self.send(200, {"stopped": JOBS.stop(str(req.get("id")))})
             m = re.fullmatch(r"/api/rec/([\w.-]+)/labels", path)

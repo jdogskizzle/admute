@@ -3,6 +3,9 @@
   replay survey REC                 scan a whole recording: per-second timeline, list of
                                     breaks, timeline picture and picture sheets (1 frame/10s)
   replay render REC START LENGTH    write a clip with muting applied to the review library
+  replay listen REC                 transcribe the commentary and fingerprint the sound (GPU)
+  replay sounds                     find sponsor reads and repeated sounds (jingles, promos,
+                                    ads) in every listened-to recording
 
 START and LENGTH are like 1:20:00 and 10:00. REC is a path inside the container; the ./replay
 wrapper translates host paths using the volumes in docker-compose.yaml.
@@ -502,6 +505,98 @@ async def render(args):
         print("Nothing was muted in this clip.")
 
 
+# --- listening: sponsor reads and repeated sounds -------------------------------------
+
+def breaks_of(work):
+    """Where the ads are in a recording: its labels once reviewed, else its survey's mutes."""
+    labels = read_json(work / "labels.json") or {}
+    if labels.get("ads") and labels.get("reviewed"):
+        return [tuple(a[:2]) for a in labels["ads"]], "labels"
+    res = read_json(work / "result.json") or {}
+    return [tuple(b) for b in res.get("breaks", [])], "survey" if res else "none"
+
+
+def read_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def listen(args):
+    import listen as L
+    path = Path(args.recording)
+    name = args.name or slug(path)
+    work = DATA / name
+    work.mkdir(parents=True, exist_ok=True)
+    began = time.monotonic()
+    print(f"Listening to {path.name}\n  reading the sound...", flush=True)
+    samples = L.audio(path)
+    length = len(samples) / L.RATE
+    print(f"  {hms(length)} of sound; fingerprinting...", flush=True)
+    bits, loud = L.fingerprint(samples)
+    np.savez_compressed(work / "prints.npz", bits=bits, loud=loud, fps=L.FPS)
+    if args.prints:
+        print(f"\nFingerprinted in {(time.monotonic() - began) / 60:.1f} min", flush=True)
+        return
+    print("  transcribing...", flush=True)
+    shown = [0.0]
+
+    def progress(t):
+        if t - shown[0] >= 600:
+            shown[0] = t
+            print(f"  {hms(t)} done ({t / max(1, time.monotonic() - began):.0f}x real time)", flush=True)
+
+    words = L.transcribe(samples, progress)
+    L.save_json(work / "speech.json", {"recording": str(path), "length": length, "words": words,
+                                       "finished": time.time()})
+    print(f"\nListened in {(time.monotonic() - began) / 60:.1f} min: {len(words)} words", flush=True)
+
+
+def sounds(args):
+    """Sponsor reads per recording (reads.json) and repeated sounds across all (data/sounds)."""
+    import listen as L
+    prints, names, breaks = [], [], {}
+    for d in sorted(DATA.iterdir()):
+        speech = read_json(d / "speech.json")
+        if speech is None:
+            continue
+        br, src = breaks_of(d)
+        breaks[d.name] = br
+        reads = L.find_reads(speech["words"], br)
+        L.save_json(d / "reads.json", {"reads": reads, "breaks_from": src, "found": time.time()})
+        n = {k: sum(r["kind"] == k for r in reads) for k in ("read", "mention", "segment")}
+        print(f"{d.name}: {n['read']} sponsor reads, {n['mention']} short mentions, "
+              f"{n['segment']} brand-named segments (breaks from {src})", flush=True)
+        if (d / "prints.npz").exists():
+            with np.load(d / "prints.npz") as p:
+                prints.append((d.name, p["bits"], p["loud"]))
+            names.append(d.name)
+    if len(prints) < 1:
+        print("Nothing listened to yet: run replay listen first.")
+        return
+    print(f"\nLooking for repeated sounds in {len(prints)} recordings...", flush=True)
+    found = L.matches(prints)
+    edge = L.edge_matches(prints, breaks)
+    print(f"  {len(found)} repeats, {len(edge)} matches between break edges", flush=True)
+    found += edge
+    words = {n: (read_json(DATA / n / "speech.json") or {}).get("words", []) for n in names}
+    out = []
+    for places in L.group(found, names):
+        pl = [{"name": n, "start": s, "end": e, "where": L.where(s, e, breaks.get(n, []))} for n, s, e in places]
+        first = pl[0]
+        text = " ".join(w[2] for w in words[first["name"]] if first["start"] <= w[0] < first["end"])
+        out.append({"id": f"{first['name']}@{first['start']:.0f}", "guess": L.guess(pl), "places": pl,
+                    "length": round(float(np.median([p["end"] - p["start"] for p in pl])), 1),
+                    "recordings": len({p["name"] for p in pl}), "text": text[:300]})
+    out.sort(key=lambda s: (-len(s["places"]), -s["length"]))
+    L.save_json(DATA.parent / "sounds" / "sounds.json", {"sounds": out, "recordings": names, "found": time.time()})
+    kinds = {}
+    for s in out:
+        kinds[s["guess"]] = kinds.get(s["guess"], 0) + 1
+    print(f"{len(out)} repeated sounds: " + ", ".join(f"{v} {k}" for k, v in sorted(kinds.items())), flush=True)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="  %(message)s")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -518,7 +613,16 @@ def main():
     r.add_argument("--warmup", type=float, default=30, help="seconds of detection before the clip starts")
     sub.add_parser("layouts", help="learn side-by-side ad layouts from labelled examples")
     sub.add_parser("train", help="learn the scene classifier from reviewed recordings")
+    li = sub.add_parser("listen", help="transcribe and fingerprint a recording's sound")
+    li.add_argument("recording")
+    li.add_argument("--name")
+    li.add_argument("--prints", action="store_true", help="only redo the fingerprints")
+    sub.add_parser("sounds", help="find sponsor reads and repeated sounds in listened-to recordings")
     args = ap.parse_args()
+    if args.cmd == "listen":
+        return listen(args)
+    if args.cmd == "sounds":
+        return sounds(args)
     if args.cmd == "layouts":
         return learn_layouts(args)
     if args.cmd == "train":

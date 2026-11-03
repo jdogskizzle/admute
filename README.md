@@ -108,6 +108,10 @@ The `studio` service is a web dashboard for checking and tuning the detector on 
   seconds of game muted, wrong mutes, late starts. "Score all reviewed recordings" checks the
   settings across every game, so tuning one game doesn't break another. It shows the lines to
   put in `docker-compose.yaml` when you find better values.
+- **Sounds**: what the commentary says and which sounds come back (see Listening below).
+  Sponsor reads found in the game, to mark Mute or Keep, and sounds heard more than once with
+  a guess at what they are (jingle at a break's edge, network promo that ends breaks, ad,
+  part of the game), to confirm. ▶ plays each one.
 - **Live**: what the proxy is doing now, and recent mute events.
 - **Jobs**: surveys and 10-minute clip renders started from the dashboard.
 
@@ -127,6 +131,8 @@ detector only looks DELAY seconds ahead, like live, so results match what live T
 ./replay render path/to/recording.ts 1:20:00 10:00    # a clip with muting applied
 ./replay layouts                                      # learn side-by-side ad layouts from labels
 ./replay train                                        # learn the scene check from reviewed games
+./replay listen path/to/recording.ts                  # transcribe + fingerprint the sound (GPU)
+./replay sounds                                       # sponsor reads and repeated sounds, all recordings
 ```
 - survey writes to `data/replay/<name>/`: `breaks.txt` and `result.json` (what would be muted),
   `trace.npz` (per-frame scores, for tuning in the studio), `timeline.csv` (per second),
@@ -137,9 +143,31 @@ detector only looks DELAY seconds ahead, like live, so results match what live T
   video decoder); `REPLAY_GPU=1` uses the GPU.
 - render uses the logo the survey learned and writes the clip to the review folder
   (mounted at `/review` in docker-compose.yaml).
+- listen and sounds: see Listening below.
 - Recordings must be inside a folder mounted in docker-compose.yaml; `./replay` translates
   host paths to container paths from those mounts.
 
+## Listening (sponsor reads, jingles, promos)
+Not used live yet: this finds examples in recordings to confirm first.
+
+- `listen` transcribes the commentary with faster-whisper (distil-large-v3, in the image, on
+  the GPU in 8-bit: about 1 GB of GPU memory, a 3-hour game in about 4 minutes) into
+  `speech.json` (each word with its time), and fingerprints the sound into `prints.npz`
+  (20 a second: 32 bits from how 33 frequency bands' loudness changes). `--prints` redoes only
+  the fingerprints.
+- `sounds` finds, in every listened-to recording:
+  - **Sponsor reads** (`reads.json`): a line in the game (not in a break) with "brought to you
+    by", "presented by", "powered by", "is the official … of" and the like, cut to its clause
+    and the brand after it. Lines under 3 s are short mentions, and a brand on a segment's
+    name ("the Allstate halftime") is left alone.
+  - **Repeated sounds** (`data/sounds/sounds.json`): stretches whose fingerprints line up
+    with another stretch, in any recording, and sounds shared by break edges (the league's
+    jingle, often under the commentary). Each gets a guess from where it falls against the
+    breaks: reviewed labels, else the survey's mutes.
+- Your answers on the Sounds page are kept in `data/sounds/verdicts.json`.
+- Settings: `SPEECH_MODEL` (model folder, default the one in the image), `SPEECH_DEVICE`
+  (`cuda` or `cpu`).
+
 ## Not done yet
-- Matching repeated ads by audio fingerprint.
+- Using sponsor reads, jingles and network promos live.
 - Starting the stream before the full delay builds up (Jellyfin waits about `DELAY` seconds on tune-in).

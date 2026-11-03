@@ -195,3 +195,7 @@ button.link { background: none; border: none; padding: 0; text-decoration: under
   .label-row input { width: 68px; }
   .tip .thumb { width: 192px; height: 108px; }
 }
+
+/* sounds page: the player stays in view while scrolling the lists */
+.sounds-top { position: sticky; top: 0; z-index: 2; background: var(--bg); padding-bottom: 6px; }
+.sounds-top .player { width: min(100%, calc(32vh * 16 / 9)); }

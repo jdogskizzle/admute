@@ -4,6 +4,9 @@ Pipeline: delay buffer + audio muting. Packets go in with a time, come out once 
 is older than the cutoff, with any audio frame inside a mute range swapped for silence.
 Live TV uses arrival time and a wall-clock cutoff; replay uses the recording's own clock
 and a cutoff that follows how far the detector has got, so both make the same decisions.
+Whether an audio frame is muted goes by its own timestamp (PTS), on the detector's clock:
+a moment's sound arrives about half a second after its picture, so going by arrival time
+would put every mute edge off by that much.
 
 DetectorProc: the ffmpeg that turns the stream into small gray frames and mono audio.
 """
@@ -11,12 +14,13 @@ DetectorProc: the ffmpeg that turns the stream into small gray frames and mono a
 import asyncio
 import logging
 import os
+import re
 from collections import deque
 
 import numpy as np
 
 from detect import AUDIO_RATE, FPS, H, W
-from ts import PKT, Demux, Entry, silence
+from ts import PKT, PTS_WRAP, Demux, Entry, pts_seconds, silence
 
 log = logging.getLogger("admute")
 
@@ -55,13 +59,19 @@ class Pipeline:
     def take(self, cutoff):
         """Remove and return (time, packet) for everything at or before cutoff, muted as needed."""
         det, buf, out = self.detector, self.buffer, []
+        anchor = det.anchor if det is not None else None
         while buf and buf[0].t <= cutoff:
             e = buf.popleft()
             if e.frames:
-                mute = (det is not None and det.muted(e.t)) or any(s <= e.t < f for s, f in self.forced)
-                if mute:
-                    for frame in e.frames:
+                mute = False
+                for frame in e.frames:
+                    pts = frame[2]
+                    t = pts_seconds(pts, anchor) if anchor and pts is not None else e.t
+                    if (det is not None and det.muted(t)) or any(s <= e.t < f for s, f in self.forced):
                         silence(frame, self.silent)
+                        mute = True
+                    if anchor and pts is not None and abs(t - anchor[1]) > 3600:
+                        anchor = det.anchor = (pts, t)  # keep it near, for streams longer than the PTS wrap
                 if mute != self.muting:
                     self.muting = mute
                     log.info("%s: audio %s", self.num, "muted" if mute else "unmuted")
@@ -72,25 +82,32 @@ class Pipeline:
         return self.buffer[-1].t if self.buffer else None
 
 
+FIRST = re.compile(r"\] \[info\] n:\s*0 pts:\s*-?\d+ pts_time:(-?[\d.]+)")
+
+
 class DetectorProc:
     """ffmpeg decoding the stream (on the GPU if asked) into frames and audio for the detector."""
 
     def __init__(self, det, gpu):
         self.det, self.gpu = det, gpu
         self.p, self.t0, self.tasks, self.dropping = None, None, [], False
+        self.first = {}  # PTS (seconds) of the first picture ("v") and sound ("a") ffmpeg decoded
+        self.timed = asyncio.Event()
 
     async def start(self):
         r, w = os.pipe()
         if self.gpu:
             hw = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-            vf = f"fps={FPS},scale_cuda={2 * W}:{2 * H},hwdownload,format=nv12"
+            vf = f"fps={FPS},scale_cuda={2 * W}:{2 * H},hwdownload,format=nv12,showinfo"
         else:
             hw = []
-            vf = f"fps={FPS},scale={2 * W}:{2 * H}:flags=area,format=nv12"
-        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostats", "-fflags", "+discardcorrupt",
-               *hw, "-f", "mpegts", "-i", "pipe:0",
-               "-map", "0:v:0", "-vf", vf, "-f", "rawvideo", "pipe:1",
-               "-map", "0:a:0", "-ac", "1", "-ar", str(AUDIO_RATE), "-f", "s16le", f"pipe:{w}"]
+            vf = f"fps={FPS},scale={2 * W}:{2 * H}:flags=area,format=nv12,showinfo"
+        # showinfo/ashowinfo report the stream timestamps of the first picture and sound
+        # (-copyts keeps them as broadcast); passthrough stops ffmpeg padding from zero.
+        cmd = [FFMPEG, "-hide_banner", "-loglevel", "level+info", "-nostats", "-fflags", "+discardcorrupt",
+               "-copyts", *hw, "-f", "mpegts", "-i", "pipe:0",
+               "-map", "0:v:0", "-vf", vf, "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1",
+               "-map", "0:a:0", "-af", "ashowinfo", "-ac", "1", "-ar", str(AUDIO_RATE), "-f", "s16le", f"pipe:{w}"]
         try:
             self.p = await asyncio.create_subprocess_exec(
                 *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -158,6 +175,15 @@ class DetectorProc:
     async def _audio(self, reader):
         n, pending = 0, b""
         block = AUDIO_RATE // 10 * 2
+        # The sound usually starts a little before or after the first picture; place it by
+        # their timestamps (wait briefly for both; without them, assume they start together).
+        try:
+            await asyncio.wait_for(self.timed.wait(), 10)
+        except asyncio.TimeoutError:
+            pass
+        shift = self.first["a"] - self.first["v"] if self.timed.is_set() else 0.0
+        if abs(shift) > 5:
+            shift = 0.0
         while True:
             chunk = await reader.read(65536)
             if not chunk:
@@ -166,7 +192,7 @@ class DetectorProc:
             k = len(pending) // block * block
             if k:
                 samples = np.frombuffer(pending[:k], np.int16)
-                self.det.audio(self.t0 + n / AUDIO_RATE, samples)
+                self.det.audio(self.t0 + shift + n / AUDIO_RATE, samples)
                 n += len(samples)
                 pending = pending[k:]
 
@@ -174,6 +200,22 @@ class DetectorProc:
         shown = 0
         while line := await self.p.stderr.readline():
             text = line.decode(errors="replace").rstrip()
+            if len(self.first) < 2 and "showinfo" in text:
+                m = FIRST.search(text)
+                if m and (kind := "a" if "ashowinfo" in text else "v") not in self.first:
+                    self.first[kind] = float(m.group(1))
+                    if kind == "v":
+                        # Picture n is at t0 + n / FPS on the detector's clock, so this anchors
+                        # stream timestamps to it.
+                        self.det.anchor = (round(self.first["v"] * 90000) % PTS_WRAP, self.t0)
+                    if len(self.first) == 2:
+                        self.timed.set()
+                        log.info("%s: muting by stream timestamps (sound starts %.2fs %s the picture)", self.det.num,
+                                 abs(self.first["a"] - self.first["v"]),
+                                 "before" if self.first["a"] < self.first["v"] else "after")
+                continue
+            if not ("[error]" in text or "[fatal]" in text):
+                continue
             if "Invalid frame dimensions 0x0" in text or "Last message repeated" in text:
                 continue  # harmless: stream joined mid-picture
             if shown < 20:

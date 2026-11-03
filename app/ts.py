@@ -20,6 +20,20 @@ LAYOUTS = {1: "FC", 2: "FL+FR", 3: "FL+FR+FC", 4: "FL+FR+BC", 5: "FL+FR+FC+BC",
            6: "FL+FR+SL+SR", 7: "FL+FR+FC+SL+SR"}
 
 
+PTS_WRAP = 1 << 33        # MPEG timestamps: 90 kHz, 33 bits
+FRAME_TICKS = 1536 * 90000 // 48000  # one AC-3 frame at 48 kHz
+
+
+def read_pts(b, i):
+    return ((b[i] >> 1) & 7) << 30 | b[i + 1] << 22 | (b[i + 2] >> 1) << 15 | b[i + 3] << 7 | b[i + 4] >> 1
+
+
+def pts_seconds(pts, anchor):
+    """Seconds from anchor (pts, t) to pts, across the 33-bit wrap: (t + difference)."""
+    d = (pts - anchor[0] + PTS_WRAP // 2) % PTS_WRAP - PTS_WRAP // 2
+    return anchor[1] + d / 90000
+
+
 class Entry:
     """One TS packet waiting in the delay buffer."""
     __slots__ = ("t", "pkt", "frames")
@@ -27,7 +41,7 @@ class Entry:
     def __init__(self, t, pkt):
         self.t = t            # arrival time (monotonic)
         self.pkt = pkt        # bytearray, edited in place when muting
-        self.frames = None    # audio frames that start in this packet
+        self.frames = None    # audio frames that start in this packet: (spans, key, pts)
 
 
 def payload_start(pkt):
@@ -97,7 +111,7 @@ class SilentFrames:
 
 def silence(frame, silent):
     """Overwrite one audio frame (spread over several packets) with silence."""
-    spans, key = frame
+    spans, key, _ = frame
     data = silent.get(key)
     if not data:
         return False
@@ -115,6 +129,10 @@ class AudioTrack:
         self.silent = silent
         self.buf = bytearray()   # track bytes not yet assigned to a frame
         self.spans = deque()     # (entry, offset, length) for each piece of buf
+        self.added = 0           # track bytes seen so far
+        self.used = 0            # track bytes split off so far (buf starts here)
+        self.pes = deque()       # (byte position, PTS) where each timestamped PES payload starts
+        self.pts = None          # PTS of the last frame
 
     def feed(self, entry):
         pkt = entry.pkt
@@ -124,10 +142,13 @@ class AudioTrack:
         if pkt[1] & 0x40:  # a PES header starts here; skip past it
             if off + 9 > PKT or pkt[off:off + 3] != b"\x00\x00\x01":
                 return
+            if pkt[off + 7] & 0x80 and off + 14 <= PKT:
+                self.pes.append((self.added, read_pts(pkt, off + 9)))
             off += 9 + pkt[off + 8]
             if off >= PKT:
                 return
         self.buf += pkt[off:]
+        self.added += PKT - off
         self.spans.append((entry, off, PKT - off))
         self._split()
 
@@ -150,11 +171,19 @@ class AudioTrack:
             size, key = hdr
             if len(buf) < size:
                 return
+            # A PES timestamp belongs to the first frame starting in its payload; frames after
+            # it are 1536 samples (32 ms) apart.
+            start, pts = self.used, None
+            while self.pes and self.pes[0][0] <= start:
+                pts = self.pes.popleft()[1]
+            if pts is None and self.pts is not None:
+                pts = (self.pts + FRAME_TICKS) % PTS_WRAP
+            self.pts = pts
             spans = self._take(size)
             first = spans[0][0]
             if first.frames is None:
                 first.frames = []
-            first.frames.append((spans, key))
+            first.frames.append((spans, key, pts))
             self.silent.get(key)  # have a matching silent frame ready before it's needed
 
     def _take(self, n):
@@ -169,6 +198,7 @@ class AudioTrack:
                 self.spans[0] = (entry, off + k, ln - k)
             left -= k
         del self.buf[:n]
+        self.used += n
         return out
 
 

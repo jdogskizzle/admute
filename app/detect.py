@@ -472,6 +472,7 @@ class AdDetector:
         self.num, self.name = num, name
         self.fmt, self.now, self.keep = fmt or wall, now or time.monotonic, keep
         self.last_t = None
+        self.anchor = None  # (PTS, detector time) of one picture: puts audio timestamps on this clock
         logos = data_dir / "logos"
         logdir = data_dir / "logs" / num
         logos.mkdir(parents=True, exist_ok=True)

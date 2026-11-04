@@ -104,10 +104,12 @@ class DetectorProc:
             vf = f"fps={FPS},scale={2 * W}:{2 * H}:flags=area,format=nv12,showinfo"
         # showinfo/ashowinfo report the stream timestamps of the first picture and sound
         # (-copyts keeps them as broadcast); passthrough stops ffmpeg padding from zero.
+        # aresample fills gaps in the sound (damaged frames), so counting samples keeps time
+        # with the timestamps: the fps filter does the same for the picture.
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "level+info", "-nostats", "-fflags", "+discardcorrupt",
                "-copyts", *hw, "-f", "mpegts", "-i", "pipe:0",
                "-map", "0:v:0", "-vf", vf, "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1",
-               "-map", "0:a:0", "-af", "ashowinfo", "-ac", "1", "-ar", str(AUDIO_RATE), "-f", "s16le", f"pipe:{w}"]
+               "-map", "0:a:0", "-af", "ashowinfo,aresample=async=1000", "-ac", "1", "-ar", str(AUDIO_RATE), "-f", "s16le", f"pipe:{w}"]
         try:
             self.p = await asyncio.create_subprocess_exec(
                 *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,

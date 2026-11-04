@@ -503,6 +503,11 @@ async def render(args):
             print(f"  {hms(s - start)} - {hms(e - start)}   ({hms(s)} - {hms(e)}, {e - s:.0f}s)")
     else:
         print("Nothing was muted in this clip.")
+    lines = [m for m in (det.listener.mutes if det.listener else []) if m[1] > start and m[0] < end]
+    if lines:
+        print("Sponsor lines muted:")
+        for s, e, text in lines:
+            print(f"  {hms(s - start)} ({hms(s)}, {e - s:.1f}s): {text[:100]}")
 
 
 # --- listening: sponsor reads and repeated sounds -------------------------------------

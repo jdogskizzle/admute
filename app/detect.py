@@ -28,7 +28,7 @@ import numpy as np
 log = logging.getLogger("admute")
 
 W, H, FPS = 384, 216, 5
-AUDIO_RATE = 8000
+AUDIO_RATE = 16000   # what speech-to-text wants
 
 
 def _env(name, default):
@@ -75,6 +75,8 @@ SCENE = _env("SCENE", 1)                       # 0: ignore the scene classifier
 SCENE_ON = _env("SCENE_ON", 0.9)               # mute when the recent average chance is above this
 SCENE_OFF = _env("SCENE_OFF", 0.5)             # unmute when it drops below this
 SCENE_WINDOW = _env("SCENE_WINDOW", 6)        # seconds averaged
+# Sponsor billboards in the commentary (listen.py), muted during sports: needs the speech model.
+SPEECH = _env("SPEECH", 1)                     # 0: don't listen
 SETTINGS = dict(SCENE=SCENE, SCENE_ON=SCENE_ON, SCENE_OFF=SCENE_OFF, SCENE_WINDOW=SCENE_WINDOW, LAYOUT=LAYOUT, LAYOUT_HOLD=LAYOUT_HOLD, LOGO_ON=LOGO_ON, LOGO_OFF=LOGO_OFF, AD_MIN=AD_MIN, SHOW_MIN=SHOW_MIN, MERGE=MERGE,
                 AD_MAX=AD_MAX, ARM=ARM, SNAP=SNAP, SURFACE=SURFACE, SURFACE_AT=SURFACE_AT,
                 SURFACE_HOLD=SURFACE_HOLD, SPLICE=SPLICE, SPLICE_WAIT=SPLICE_WAIT)
@@ -522,6 +524,9 @@ class AdDetector:
         # Recordings: the title from the file name. Only programs the classifier learned from use it.
         self.live, self._sports_at = live, 0.0
         self._sports = not live and scene_mod.covers(self.classifier, title or scene_mod.show_title(name))
+        self.listener = None
+        if not live and not trace:   # renders of recordings (games); surveys don't need it
+            self._listen(True)
         if self.classifier:
             log.info("%s: scene check ready (learned from %d games)%s", num, len(self.classifier.info.get("trained_on", [])),
                      "; used during sports, per the guide" if live else "")
@@ -603,6 +608,7 @@ class AdDetector:
             self._sports_at = time.monotonic()
             g = scene_mod.guide()
             titles = g.sports_now(self.num, time.time()) if g else []
+            self._listen(bool(titles))
             title = next((x for x in titles if scene_mod.covers(self.classifier, x)), None)
             was, self._sports = self._sports, title is not None
             if self.classifier and was != self._sports:
@@ -622,7 +628,27 @@ class AdDetector:
         if time.monotonic() - self._last_save > 120:
             self.save()
 
+    def _listen(self, on):
+        """Start or stop listening for sponsor billboards (sports only)."""
+        import listen
+        on = on and bool(SPEECH) and os.path.isdir(listen.SPEECH_MODEL)
+        if on and self.listener is None:
+            self.listener = listen.Listener(AUDIO_RATE, lambda: self.now(), _env("DELAY", 10), self._event,
+                                            self.fmt, sync=not self.live)
+            log.info("%s: listening for sponsor billboards", self.num)
+        elif not on and self.listener is not None:
+            self.listener.close()
+            self.listener = None
+            log.info("%s: stopped listening for sponsor billboards", self.num)
+
     def audio(self, t, samples):
+        if self.listener is not None:
+            try:
+                self.listener.audio(t, samples, self.intervals)
+            except Exception as exc:
+                log.warning("%s: speech-to-text failed, no longer listening: %s", self.num, exc)
+                self.listener.close()
+                self.listener = None
         n = AUDIO_RATE // 10
         for i in range(0, len(samples) - n + 1, n):
             w = samples[i:i + n].astype(np.float32)
@@ -633,7 +659,7 @@ class AdDetector:
                 self._silent = True
 
     def muted(self, t):
-        return any(s <= t < e for s, e in self.intervals)
+        return any(s <= t < e for s, e in self.intervals) or (self.listener is not None and self.listener.muted(t))
 
     def save_trace(self, path):
         rows, sil, lay, _ = self.trace
@@ -750,6 +776,8 @@ class AdDetector:
         write_png(self.png_path, img)
 
     def close(self):
+        if self.listener is not None:
+            self.listener.close()
         try:
             self.save()
         finally:
@@ -768,4 +796,5 @@ class AdDetector:
             "state": self.state,
             "armed": self.armed,
             "ads_muted": self.ads,
+            "sponsor_lines_muted": len(self.listener.mutes) if self.listener else 0,
         }

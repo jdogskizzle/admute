@@ -148,7 +148,20 @@ detector only looks DELAY seconds ahead, like live, so results match what live T
   host paths to container paths from those mounts.
 
 ## Listening (sponsor reads, jingles, promos)
-Not used live yet: this finds examples in recordings to confirm first.
+**Live:** during sports (programs the guide calls sports; renders of recordings too), each
+channel's sound is transcribed as it comes in: every `SPEECH_STEP` seconds (1) the last
+`SPEECH_WINDOW` seconds (10) go through the model, and a sponsor billboard found in them
+(the same rule as below) is muted from its first word to its last, picture left alone.
+"Brought to you by" or "powered by" is usually said a second or two into the line, so with
+viewers `DELAY` seconds behind it is muted from the start. Lines inside an ad break aren't
+looked for. The model is loaded when the first channel starts listening and freed a minute
+after the last one stops. `SPEECH=0` turns it off. Events log each muted line.
+
+Jingles and network promos are not used live: on the reviewed games the jingle comes just
+before breaks the detector already starts on time, and a house promo is followed by more
+ads too often (4 of 15) to unmute on.
+
+**Offline**, to find examples and check the rules:
 
 - `listen` transcribes the commentary with faster-whisper (distil-large-v3, in the image, on
   the GPU in 8-bit: about 1 GB of GPU memory, a 3-hour game in about 4 minutes) into
@@ -168,9 +181,9 @@ Not used live yet: this finds examples in recordings to confirm first.
     breaks: reviewed labels, else the survey's mutes. Two recordings of the same broadcast
     (a doubleheader's second game recorded while the first was on) are not counted as repeats.
 - Your answers on the Sounds page are kept in `data/sounds/verdicts.json`.
-- Settings: `SPEECH_MODEL` (model folder, default the one in the image), `SPEECH_DEVICE`
-  (`cuda` or `cpu`).
+- Settings: `SPEECH` (0: don't listen live), `SPEECH_MODEL` (model folder, default the one in
+  the image), `SPEECH_DEVICE` (`cuda` or `cpu`; the CPU is too slow to catch lines live),
+  `SPEECH_WINDOW`, `SPEECH_STEP`.
 
 ## Not done yet
-- Using sponsor reads, jingles and network promos live.
 - Starting the stream before the full delay builds up (Jellyfin waits about `DELAY` seconds on tune-in).

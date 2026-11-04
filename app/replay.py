@@ -565,9 +565,9 @@ def sounds(args):
         breaks[d.name] = br
         reads = L.find_reads(speech["words"], br)
         L.save_json(d / "reads.json", {"reads": reads, "breaks_from": src, "found": time.time()})
-        n = {k: sum(r["kind"] == k for r in reads) for k in ("read", "mention", "segment")}
-        print(f"{d.name}: {n['read']} sponsor reads, {n['mention']} short mentions, "
-              f"{n['segment']} brand-named segments (breaks from {src})", flush=True)
+        n = {k: sum(r["kind"] == k for r in reads) for k in ("billboard", "credit", "segment")}
+        print(f"{d.name}: {n['billboard']} sponsor billboards (muted), {n['credit']} sponsor credits and "
+              f"{n['segment']} brand-named segments (left on); breaks from {src}", flush=True)
         if (d / "prints.npz").exists():
             with np.load(d / "prints.npz") as p:
                 prints.append((d.name, p["bits"], p["loud"]))

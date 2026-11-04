@@ -1,8 +1,9 @@
 """Listening to a recording's sound: what's said, and which sounds come back.
 
-- Speech: the commentary as words with times (faster-whisper on the GPU). Sponsor reads
-  are whole sentences like "...is brought to you by...": admute could mute just those while
-  the picture plays on. A brand on a segment's name ("Verizon halftime") is left alone.
+- Speech: the commentary as words with times (faster-whisper on the GPU). Sponsor
+  billboards and slogans ("The NFL powered by Verizon 5G") are ads: admute could mute just
+  those while the picture plays on. The commentators naming a feature's sponsor, or a brand
+  in a segment's name ("coming up on the Verizon halftime show"), is left alone.
 - Fingerprints: 20 a second, 32 bits each, from how the loudness of 33 frequency bands
   changes (the Philips/Haitsma method). The same sound gives mostly the same values, so
   sounds that repeat (the league's music jingle, network promos, ads) can be found across
@@ -102,14 +103,32 @@ def clause(ws, i, j, back=6.0, ahead=2.0, pause=0.3):
     return ws[i:j + 1]
 
 
-# Phrases that make a sentence a sponsor read.
-READ = re.compile(r"\b(brought to you by|presented by|sponsored by|powered by|courtesy of|in partnership with"
-                  r"|(?:is|are) the official \w+(?: \w+){0,3} of|official (?:sponsor|partner)"
-                  r"|proud (?:sponsor|partner)|(?:is|are) proud to)\b", re.I)
+# Sponsor lines are of two kinds. Billboards: the broadcast's own sponsor tags and slogans,
+# read by an announcer, the same words every time ("The NFL powered by Verizon 5G", "The NFL
+# on CBS is sponsored by GEICO", "You're watching the Allstate halftime", "American Express
+# is the official payments partner of the NFL"): these are ads, muted. Credits: the
+# commentators naming a feature's sponsor ("aerial coverage brought to you by Taco Bell",
+# "first half highlights presented by Target"): left on, like a brand in a segment's name
+# ("coming up on the Verizon halftime show").
+BY = r"(?:is |are )?(?:powered|sponsored|brought to you|presented|delivered) by"
+NETWORK = r"(?:cbs|fox|nbc|abc|espn|prime(?: video)?|amazon)"
+BILLBOARD = re.compile("|".join([
+    rf"\bthe nfl(?: on {NETWORK})?,? {BY}",                                   # the NFL (on CBS) powered by ...
+    rf"\bon {NETWORK}(?: sports)? {BY}",                                       # ... on CBS is sponsored by ...
+    rf"\b(?:sunday|monday|thursday|saturday) night football,? {BY}",           # Sunday Night Football is brought to you by
+    rf"\bhalftime (?:show|report),? {BY}",                                     # ... halftime show is brought to you by ...
+    r"\b(?:you're watching|you are watching|this has been|presents) the (?:[\w&'.-]+ ){1,3}halftime",
+    r"\bofficial \w+(?: \w+){0,2} (?:partner|sponsor|provider)s? of\b",      # ... is the official payments partner of
+    r"\b(?:is|are) the official \w+(?: \w+){0,2} of the nfl\b",
+    r"\buse (?:the )?(?:promo |offer )?code\b",                               # promo codes
+    r"\bpowered by \w+ 5g\b",                                                 # slogans
+]), re.I)
+CREDIT = re.compile(r"\b(brought to you by|presented by|sponsored by|powered by|delivered by|courtesy of"
+                    r"|in partnership with)\b", re.I)
 # A brand on a segment's name, e.g. "the Verizon halftime report": left alone.
 SEGMENT = re.compile(r"\b(?:[A-Z][\w&'.-]+ ){1,3}(?:halftime|skycam|sky cam|report|update|kickoff"
-                     r"|pregame|postgame|starting lineups?|player of the game|play of the game|drive chart|red zone)\b")
-SHORT = 3.0      # seconds: a sponsor phrase in a shorter sentence is just a mention
+                     r"|pregame|postgame|starting lineups?|player of the game|play of the game|drive chart)\b")
+LONG = 10.0      # seconds: a longer "sentence" is run-on speech, so only the clause is muted
 
 
 def inside(t0, t1, spans):
@@ -120,28 +139,41 @@ def inside(t0, t1, spans):
 
 
 def find_reads(words, breaks):
-    """Sponsor reads in the program (not in the ad breaks). Each is {start, end, text, context,
-    kind}: "read" (would be muted) or "mention" (a sponsor phrase in a short line, left on),
-    and "segment" for a brand on a segment's name (left on)."""
+    """Sponsor lines in the program (not in the ad breaks). Each is {start, end, text, context,
+    kind}: "billboard" (an ad: muted), "credit" (a feature's sponsor named: left on) or
+    "segment" (a brand in a segment's name: left on). A billboard split over two sentences
+    ("The NFL." "Powered by Verizon 5G.") is found across the split."""
+    sents = sentences(words)
     out = []
-    for ws in sentences(words):
+    for n, ws in enumerate(sents):
         if inside(ws[0][0], ws[-1][1], breaks) > 0.5:
             continue
+        prev = sents[n - 1] if n and ws[0][0] - sents[n - 1][-1][1] < 1.5 else []
+        tail = prev[-4:]
         full = text_of(ws)
-        starts = np.cumsum([0] + [len(w[2]) + 1 for w in ws])   # character offset of each word
-        m = READ.search(full)
-        if m:
+        joined = text_of(tail + ws)
+        starts = np.cumsum([0] + [len(w[2]) + 1 for w in tail + ws])   # character offset of each word
+        m = BILLBOARD.search(joined)
+        if m and m.end() > starts[len(tail)]:                          # it reaches into this sentence
             i = int(np.searchsorted(starts, m.start(), "right") - 1)
             j = int(np.searchsorted(starts, m.end() - 1, "right") - 1)
-            part = clause(ws, i, j)
-            kind = "read" if part[-1][1] - part[0][0] >= SHORT else "mention"
-        elif SEGMENT.search(full):
-            part, kind = ws, "segment"
-        else:
+            span = (prev if i < len(tail) else []) + ws
+            if span[-1][1] - span[0][0] > LONG:
+                span = clause(tail + ws, i, j)
+            out.append({"start": span[0][0], "end": span[-1][1], "text": text_of(span), "context": full[:400],
+                        "kind": "billboard"})
             continue
-        out.append({"start": part[0][0], "end": part[-1][1], "text": text_of(part), "context": full[:400],
-                    "kind": kind})
-    return out
+        m = CREDIT.search(full)
+        if m or SEGMENT.search(full):
+            out.append({"start": ws[0][0], "end": ws[-1][1], "text": full[:300], "context": full[:400],
+                        "kind": "credit" if m else "segment"})
+    # a billboard that also reached back into the previous sentence replaces that one's entry
+    keep = []
+    for r in out:
+        if keep and r["kind"] == "billboard" and keep[-1]["kind"] != "billboard" and r["start"] <= keep[-1]["start"]:
+            keep.pop()
+        keep.append(r)
+    return keep
 
 
 # --- fingerprints ---------------------------------------------------------------------
@@ -222,7 +254,19 @@ def matches(prints, min_len=2.0, max_count=120, quiet=-75.0, min_hits=10):
             continue
         out.append((int(i), (a0 - offs[i]) / FPS, (a1 - offs[i]) / FPS,
                     int(j), (b0 - offs[j]) / FPS, (b1 - offs[j]) / FPS, int(hits)))
-    return out
+    return same_broadcast(out)
+
+
+def same_broadcast(found, most=180.0):
+    """Drop matches between two recordings of the same broadcast (a doubleheader's second
+    game recorded while the first was still on): many minutes matching at one time offset,
+    which no repeated sound does."""
+    total = {}
+    for i, a0, a1, j, b0, b1, _ in found:
+        key = (i, j, round(b0 - a0))
+        total[key] = total.get(key, 0) + (a1 - a0)
+    near = lambda i, j, d: max(total.get((i, j, d + k), 0) for k in (-1, 0, 1))
+    return [m for m in found if near(m[0], m[3], round(m[4] - m[1])) <= most]
 
 
 def edge_matches(prints, breaks, span=12.0, w=2.0, close=0.3):

@@ -265,9 +265,29 @@ def sounds_page():
     recs = []
     for r in recordings():
         reads = (read_json(REPLAY / r["name"] / "reads.json") or {}).get("reads", [])
+        # answers are keyed by the line's start second; a line found again may start a little
+        # earlier or later, so an answer inside it still counts
+        mine = [(int(k.rsplit("@", 1)[1]), k) for k in verdicts
+                if k.startswith(f"read:{r['name']}@") and k.rsplit("@", 1)[1].isdigit()]
+        for x in reads:
+            key = f"read:{r['name']}@{round(x['start'])}"
+            if key not in verdicts:
+                key = next((k for sec, k in mine if x["start"] - 1 <= sec <= x["end"]), key)
+            x["key"] = key
         recs.append({"name": r["name"], "title": r["title"], "listened": r["listened"], "job": r["job"],
                      "reads": reads})
     found = read_json(SOUNDS / "sounds.json") or {}
+    # a sound found again may get another id; an answer follows it by where it was heard
+    answered = [(k, v.get("places") or []) for k, v in verdicts.items() if k.startswith("sound:")]
+    for snd in found.get("sounds", []):
+        key = f"sound:{snd['id']}"
+        if key not in verdicts:
+            for k, places in answered:
+                if any(p["name"] == q["name"] and p["start"] < q["end"] and q["start"] < p["end"]
+                       for p in snd["places"] for q in places):
+                    key = k
+                    break
+        snd["key"] = key
     return {"recordings": recs, "sounds": found.get("sounds", []), "found": found.get("found"),
             "verdicts": verdicts}
 

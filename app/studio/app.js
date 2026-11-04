@@ -1017,8 +1017,8 @@ async function soundsView() {
       <div class="hint" id="shint">Press ▶ on a row to hear it</div></div><div class="dim" id="snow" style="font-size:12px;margin-top:4px"></div></div>
     <div id="sbody"><div class="card empty">Loading…</div></div>`;
   const vid = $("#svid"), st = { h: 540, base: 0, name: null };
-  let D = null, open = new Set(), filter = "read";
-  try { filter = localStorage.getItem("studio.readfilter") || "read"; } catch (e) { /* no storage */ }
+  let D = null, open = new Set(), filter = "billboard";
+  try { filter = localStorage.getItem("studio.readfilter") || "billboard"; } catch (e) { /* no storage */ }
   const play = (name, t, what) => {
     if (st.name !== name) { st.name = name; st.src = null; st.base = -1e9; vid.removeAttribute("src"); vid.load(); }
     $("#shint").hidden = true;
@@ -1040,10 +1040,11 @@ async function soundsView() {
     // sponsor reads
     const rows = [];
     for (const r of recs) for (const x of r.reads) {
-      const key = `read:${r.name}@${Math.round(x.start)}`, v = verdict(key);
-      if (filter === "read" && x.kind !== "read" && !v) continue;
+      const key = x.key || `read:${r.name}@${Math.round(x.start)}`, v = verdict(key);
+      if (filter === "billboard" && x.kind !== "billboard") continue;
       rows.push(`<tr><td class="mono" style="white-space:nowrap">${hms(x.start)}</td>
-        <td><span class="tag ${x.kind === "read" ? "warn" : ""}">${x.kind === "read" ? "would mute" : x.kind === "mention" ? "short mention" : "brand-named segment"}</span>
+        <td><span class="tag ${x.kind === "billboard" ? "warn" : ""}">${x.kind === "billboard" ? "billboard: would mute" : x.kind === "credit" ? "sponsor credit: left on" : "brand-named segment: left on"}</span>
+          ${v && (v === "mute") !== (x.kind === "billboard") ? `<span class="tag bad" title="your answer differs from the rule">you said ${v}</span>` : ""}
           <div class="dim" style="font-size:12px">${esc(r.title.replace(/^NFL Football\s*/, ""))}</div></td>
         <td title="${esc(x.context)}">“${esc(x.text)}” <span class="dim">${(x.end - x.start).toFixed(1)}s</span></td>
         <td style="white-space:nowrap"><button data-play="${esc(r.name)}" data-t="${x.start - 4}" data-what="${esc(x.text)}">▶</button>
@@ -1052,15 +1053,17 @@ async function soundsView() {
     }
     const nReads = recs.reduce((n, r) => n + r.reads.length, 0);
     html += `<div class="card" style="margin-top:14px"><h2>Sponsor reads</h2>
-      <div class="row"><label><input type="radio" name="rf" value="read" ${filter === "read" ? "checked" : ""}> ones it would mute</label>
-        <label><input type="radio" name="rf" value="all" ${filter === "all" ? "checked" : ""}> also short mentions and brand-named segments (left on)</label></div>
+      <p class="dim" style="font-size:12px">Billboards and slogans (“The NFL powered by Verizon 5G”, “The NFL on CBS is sponsored by…”) are muted;
+        the commentators naming a feature's sponsor (“aerial coverage brought to you by…”) or a brand in a segment's name are left on.</p>
+      <div class="row"><label><input type="radio" name="rf" value="billboard" ${filter === "billboard" ? "checked" : ""}> ones it would mute</label>
+        <label><input type="radio" name="rf" value="all" ${filter === "all" ? "checked" : ""}> also the ones left on</label></div>
       ${rows.length ? `<table><tbody>${rows.join("")}</tbody></table>` : `<p class="dim">${nReads ? "None to show." : "Listen to a recording, then Find reads."}</p>`}</div>`;
     // repeated sounds
     const snd = D.sounds;
     html += `<div class="card" style="margin-top:14px"><h2>Repeated sounds</h2>
       <p class="dim" style="font-size:12px">Sounds heard more than once, most often first, with a guess from where they fall against the ads. ▶ plays each place it was heard.</p>
       ${snd.length ? `<table><tbody>${snd.map(x => {
-        const key = `sound:${x.id}`, v = verdict(key);
+        const key = x.key || `sound:${x.id}`, v = verdict(key);
         return `<tr><td style="white-space:nowrap"><button data-open="${esc(x.id)}">${open.has(x.id) ? "▾" : "▸"}</button></td>
           <td><span class="tag">${esc(SOUND_KINDS[x.guess] || x.guess)}?</span> <span class="dim">${x.places.length}× in ${x.recordings} rec · ${x.length}s</span>
             <div style="font-size:13px">${x.text ? `“${esc(x.text.slice(0, 160))}”` : `<span class="dim">no words (music?)</span>`}</div>

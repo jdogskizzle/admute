@@ -156,14 +156,17 @@ Not used live yet: this finds examples in recordings to confirm first.
   (20 a second: 32 bits from how 33 frequency bands' loudness changes). `--prints` redoes only
   the fingerprints.
 - `sounds` finds, in every listened-to recording:
-  - **Sponsor reads** (`reads.json`): a line in the game (not in a break) with "brought to you
-    by", "presented by", "powered by", "is the official … of" and the like, cut to its clause
-    and the brand after it. Lines under 3 s are short mentions, and a brand on a segment's
-    name ("the Allstate halftime") is left alone.
+  - **Sponsor lines** (`reads.json`), in the game (not in a break). Billboards and slogans
+    are ads and would be muted: the broadcast's own sponsor tags ("The NFL powered by Verizon
+    5G", "The NFL on CBS is sponsored by…", "Sunday Night Football is brought to you by…",
+    "You're watching the Allstate halftime"), "is the official … partner of" and promo codes.
+    The commentators naming a feature's sponsor ("aerial coverage brought to you by…") or a
+    brand in a segment's name ("coming up on the Verizon halftime show") are left on.
   - **Repeated sounds** (`data/sounds/sounds.json`): stretches whose fingerprints line up
     with another stretch, in any recording, and sounds shared by break edges (the league's
     jingle, often under the commentary). Each gets a guess from where it falls against the
-    breaks: reviewed labels, else the survey's mutes.
+    breaks: reviewed labels, else the survey's mutes. Two recordings of the same broadcast
+    (a doubleheader's second game recorded while the first was on) are not counted as repeats.
 - Your answers on the Sounds page are kept in `data/sounds/verdicts.json`.
 - Settings: `SPEECH_MODEL` (model folder, default the one in the image), `SPEECH_DEVICE`
   (`cuda` or `cpu`).

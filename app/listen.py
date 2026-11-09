@@ -117,12 +117,12 @@ def clause(ws, i, j, back=6.0, ahead=2.0, pause=0.3):
 BY = r"(?:is |are )?(?:powered|sponsored|brought to you|presented|delivered) by"
 NETWORK = r"(?:cbs|fox|nbc|abc|espn|prime(?: video)?|amazon)"
 BILLBOARD = re.compile("|".join([
-    rf"\bthe nfl(?: on {NETWORK})?,? {BY}",                                   # the NFL (on CBS) powered by ...
-    rf"\bon {NETWORK}(?: sports)? {BY}",                                       # ... on CBS is sponsored by ...
+    rf"\bthe nfl(?: on {NETWORK})?[.,]? {BY}",                                # the NFL (on CBS) powered by ...
+    rf"\bon {NETWORK}(?: sports)?[.,]? {BY}",                                  # ... on CBS is sponsored by ...
     rf"\b(?:sunday|monday|thursday|saturday) night football,? {BY}",           # Sunday Night Football is brought to you by
     # The X halftime show is brought to you by ... (as a line of its own, not "their halftime
-    # show, powered by ...")
-    rf"(?:^|\bthe |[.?!] )(?:[\w&'.-]+ ){{0,3}}halftime (?:show|report),? {BY}",
+    # show, powered by ..." or "X will headline the Thanksgiving halftime show, powered by ...")
+    rf"(?:^|[.?!] )(?:the )?(?:[\w&'.-]+ ){{0,3}}halftime (?:show|report),? {BY}",
     r"\b(?:you're watching|you are watching|this has been|presents) the (?:[\w&'.-]+ ){1,3}halftime",
     r"\bofficial \w+(?: \w+){0,2} (?:partner|sponsor|provider)s? of\b",      # ... is the official payments partner of
     r"\b(?:is|are) the official \w+(?: \w+){0,2} of the nfl\b",
@@ -134,6 +134,7 @@ CREDIT = re.compile(r"\b(brought to you by|presented by|sponsored by|powered by|
 # A brand on a segment's name, e.g. "the Verizon halftime report": left alone.
 SEGMENT = re.compile(r"\b(?:[A-Z][\w&'.-]+ ){1,3}(?:halftime|skycam|sky cam|report|update|kickoff"
                      r"|pregame|postgame|starting lineups?|player of the game|play of the game|drive chart)\b")
+BY_START = re.compile(rf"\s*(?:{NETWORK}(?: sports)?[.,]? )?{BY}\b", re.I)
 LONG = 10.0      # seconds: a longer "sentence" is run-on speech, so only the clause is muted
 
 
@@ -154,7 +155,10 @@ def find_reads(words, breaks):
     for n, ws in enumerate(sents):
         if inside(ws[0][0], ws[-1][1], breaks) > 0.5:
             continue
-        prev = sents[n - 1] if n and ws[0][0] - sents[n - 1][-1][1] < 1.5 else []
+        # "On ... CBS is sponsored by Audi": a line starting with the sponsor part can follow
+        # its first half after a longer pause
+        near = 6.0 if BY_START.match(ws[0][2] + " " + text_of(ws[1:4])) else 1.5
+        prev = sents[n - 1] if n and ws[0][0] - sents[n - 1][-1][1] < near else []
         tail = prev[-4:]
         full = text_of(ws)
         joined = text_of(tail + ws)

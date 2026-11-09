@@ -98,7 +98,10 @@ class DetectorProc:
         r, w = os.pipe()
         if self.gpu:
             hw = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-            vf = f"fps={FPS},scale_cuda={2 * W}:{2 * H},hwdownload,format=nv12,showinfo"
+            # Decode on the GPU but shrink on the CPU, the same way as without it: the scene
+            # check learned from pictures shrunk like that, and scale_cuda's differ noticeably.
+            # Only FPS frames a second are copied off the GPU, so this is cheap.
+            vf = f"fps={FPS},hwdownload,format=nv12,scale={2 * W}:{2 * H}:flags=area,format=nv12,showinfo"
         else:
             hw = []
             vf = f"fps={FPS},scale={2 * W}:{2 * H}:flags=area,format=nv12,showinfo"

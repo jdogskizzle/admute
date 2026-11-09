@@ -278,14 +278,14 @@ class Decider:
         layout: a learned side-by-side ad layout matches this frame; scene: the scene
         classifier's chance that this second is an ad (None without a classifier)."""
         p = self.p
-        if scene is not None and p["SCENE"]:
-            return self._scene_step(t, scene, layout)
         if layout and p["LAYOUT"]:
             if self.layout_since is None:
                 self.layout_since = t
         else:
             self.layout_since = None
         sbs = self.layout_since is not None and t - self.layout_since >= p["LAYOUT_HOLD"]
+        if scene is not None and p["SCENE"]:
+            return self._scene_step(t, scene, sbs)
         if sbs:  # a side-by-side ad: whatever graphics the small game picture shows don't count
             states = [False] * max(1, len(states))
         if surface:
@@ -368,7 +368,7 @@ class Decider:
         win = [(s, q) for s, q in self.scene_hist if s > t - p["SCENE_WINDOW"]]
         avg = sum(q for _, q in win) / len(win)
         floor = t - (_env("DELAY", 10) - 1)  # viewers haven't heard anything after this yet
-        sbs = layout and p["LAYOUT"]
+        sbs = layout  # a side-by-side layout has matched for LAYOUT_HOLD
         if self.state == "show":
             if avg >= p["SCENE_ON"] or sbs:
                 first = next((s for s, q in win if q > 0.5), sec)

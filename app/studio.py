@@ -116,7 +116,7 @@ def trace(name):
     if not hit or hit[0] != mtime:
         with np.load(path) as d:
             hit = (mtime, {k: d[k] for k in ("frames", "silences", "splice", "layouts", "layout_names",
-                                             "layout_thresholds") if k in d})
+                                             "layout_thresholds", "scene_sec", "scene_feats") if k in d})
         _traces[name] = hit
     return hit[1]
 

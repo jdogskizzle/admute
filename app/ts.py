@@ -202,6 +202,22 @@ class AudioTrack:
         return out
 
 
+def _crc32(data):
+    """The MPEG-2 CRC of a table section; 0 over a whole section means it arrived intact."""
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc = _CRC[((crc >> 24) ^ b) & 0xFF] ^ ((crc << 8) & 0xFFFFFFFF)
+    return crc
+
+
+_CRC = []
+for _i in range(256):
+    _c = _i << 24
+    for _ in range(8):
+        _c = ((_c << 1) ^ 0x04C11DB7 if _c & 0x80000000 else _c << 1) & 0xFFFFFFFF
+    _CRC.append(_c)
+
+
 def _has_ac3_descriptor(desc):
     i = 0
     while i + 2 <= len(desc):
@@ -237,7 +253,12 @@ class Demux:
         if off + 12 > PKT:
             return
         table = pkt[off]
-        end = min(off + 3 + (((pkt[off + 1] & 0x0F) << 8) | pkt[off + 2]) - 4, PKT)
+        full = off + 3 + (((pkt[off + 1] & 0x0F) << 8) | pkt[off + 2])
+        # Skip damaged tables: a bad packet during a reception glitch can otherwise add a
+        # track that doesn't exist. (A table longer than one packet can't be checked here.)
+        if full <= PKT and _crc32(pkt[off:full]):
+            return
+        end = min(full - 4, PKT)
         if pid == 0 and table == 0:
             for i in range(off + 8, end - 3, 4):
                 if (pkt[i] << 8) | pkt[i + 1]:

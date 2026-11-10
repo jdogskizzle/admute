@@ -169,10 +169,11 @@ turnovers).
   and long returns. Overturned calls go by the final ruling.
 - **When**: ESPN logs each play with a wall-clock time. The recording's own clock (its last
   write, minus its length) says where that falls in the file. The broadcast shows the snap
-  some seconds later, and how many differs by game (about 22 s on NBC, 16 s on FOX and CBS in
-  the games so far). So each play's snap is looked for in the picture (a still wide shot of the
-  field, then everything moving at once), and the plays where it's clear set the game's lag
-  for the rest. Clips run from `RECAP_PRE` (4) seconds before the snap to the end of the
+  some seconds later, and how many differs by game (about 22 s on NBC, 16 s on FOX and CBS,
+  28 s on ESPN's Monday night game so far). So each play's snap is looked for in the picture
+  (a still wide shot of the field, then everything moving at once; or a cut into a wide shot
+  that's already moving, as ESPN does), and once three plays show one, they set the game's lag
+  for the rest. Until then clips cover 12-28 s after ESPN's time, and are cut again after. Clips run from `RECAP_PRE` (4) seconds before the snap to the end of the
   play, longer for long gains and scores, with a caption at the start. A clip whose snap
   moves as the lag becomes clearer is cut again.
 - Clips are H.264 at the broadcast's size, encoded on the CPU (a few seconds each;

@@ -29,6 +29,9 @@ from ts import PKT
 
 FEED = os.environ.get("RECAP_FEED", "https://site.api.espn.com/apis/site/v2/sports")
 LAG = float(os.environ.get("RECAP_LAG", "18"))     # first guess, seconds from ESPN's time to the snap on air
+# Until the game's lag is known, clips cover every lag seen so far (FOX and CBS 16s, NBC 22s,
+# ESPN 26s), and are cut again once it is.
+LAG_RANGE = (12.0, 28.0)
 PRE = float(os.environ.get("RECAP_PRE", "4"))      # seconds of the line-up shown before the snap
 GPU = os.environ.get("RECAP_GPU", "0") == "1"      # encode clips with NVENC instead of x264
 # Guide titles of the sports the feed covers, and the feed's name for each.
@@ -114,7 +117,7 @@ def _headline(text, kind):
     line = sents[0] if sents else text
     if kind == "RETURN" and len(sents) > 1:
         line = sents[1]
-    elif kind == "FUMBLE":
+    elif kind == "FUMBLE" and "FUMBLES" not in line:
         line += ", " + next((x for x in sents if "FUMBLES" in x), "")
     line = re.sub(r",? (?:Center|Holder)-[\w.'-]+", "", line)
     line = re.sub(r"\s*\([^)]*\)|\s*\[[^]]*\]", "", line)      # tacklers
@@ -215,6 +218,18 @@ def snaps(path, start, length):
         if after.mean() < 6 or after.max() > 45:
             continue                                            # no burst (or a cut to another shot)
         out.append((start + (i + 1) / SFPS, float(after.mean() / (before.mean() + 1))))
+    # Some productions (ESPN's) cut to the wide shot just as the ball is snapped: a cut into a
+    # grass shot that's already moving counts too, as a weaker sign.
+    for i in range(1, len(move) - SFPS - 2):
+        after = move[i + 1:i + 1 + SFPS]
+        into_grass = green[i + 1:i + 1 + SFPS].mean()
+        cut = move[i] >= 30 and (move[i] >= 3 * max(move[i - 1], 1) or into_grass - green[max(0, i - 3):i + 1].mean() >= 0.3)
+        if not cut or into_grass < 0.4:
+            continue                                            # not a cut into a wide shot
+        if after[:3].mean() < 4 or after.mean() < 6 or after.max() > 45:
+            continue                                            # not moving right away
+        out.append((start + (i + 1) / SFPS, 1.0))
+    out.sort()
     # one per rise: the first of neighbours
     keep = []
     for t, c in out:
@@ -226,10 +241,10 @@ def snaps(path, start, length):
 
 def game_lag(found):
     """The game's lag from the snap candidates of its plays (lists of lags): the 2-second span
-    that most plays have a candidate in. LAG until three plays have one."""
+    that most plays have a candidate in. None until three plays have one."""
     plays = [ls for ls in found if ls]
     if len(plays) < 3:
-        return LAG
+        return None
     best = None
     for x in sorted(l for ls in plays for l in ls):
         hits = [min(ls, key=lambda l: abs(l - x - 1)) for ls in plays if any(x <= l <= x + 2 for l in ls)]
@@ -326,25 +341,29 @@ class Recap:
             if p["id"] not in found and t > 0 and t + 40 <= length:
                 found[p["id"]] = [round(x - t, 2) for x, _ in snaps(self.path, t + 5, 30)]
         lag = game_lag([found[p["id"]] for p in plays if p["id"] in found])
-        self.state["lag"] = round(lag, 2)
+        self.state["lag"] = None if lag is None else round(lag, 2)
         for p in plays:
             t = p["wall"] - start_wall
-            near = [l for l in found.get(p["id"], []) if abs(l - lag) <= 2.5]
-            snap = t + (min(near, key=lambda l: abs(l - lag)) if near else lag)
-            a, b = snap - PRE, snap + p["after"]
+            if lag is None:   # not known yet: wide enough for any network
+                near, snap = [], None
+                a, b = t + LAG_RANGE[0] - PRE, t + LAG_RANGE[1] + p["after"]
+            else:
+                near = [l for l in found.get(p["id"], []) if abs(l - lag) <= 2.5]
+                snap = t + (min(near, key=lambda l: abs(l - lag)) if near else lag)
+                a, b = snap - PRE, snap + p["after"]
             if a < 0 or b > length - 2:
                 continue  # before the recording, or not recorded yet
             old = clips.get(p["id"])
-            if old and abs(old.get("snap", old["start"] + PRE) - snap) < 1.5:
+            if old and (snap is None or (old.get("snap") is not None and abs(old["snap"] - snap) < 1.5)):
                 continue
             out = self.work / "clips" / f"{p['id']}.mp4"
             began = time.monotonic()
             cut(self.path, a, b - a, out, [p["text"], f"{p['when']}   {p['score']}"])
-            clips[p["id"]] = {**p, "start": round(a, 2), "end": round(b, 2), "snap": round(snap, 2),
+            clips[p["id"]] = {**p, "start": round(a, 2), "end": round(b, 2), "snap": snap and round(snap, 2),
                               "seen": bool(near), "clip": out.name, "took": round(time.monotonic() - began, 1)}
             made.append(clips[p["id"]])
             self._save()
-            log(f"  {p['when']:9s} {p['kind']:6s} {p['text'][:64]}  ({'snap seen' if near else 'by lag'}"
+            log(f"  {p['when']:9s} {p['kind']:6s} {p['text'][:64]}  ({'snap seen' if near else 'by lag' if lag else 'lag not known yet'}"
                 f"{', re-cut' if old else ''})")
         self._save()
         return made

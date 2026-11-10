@@ -623,7 +623,7 @@ def recap(args):
     began = time.monotonic()
     made = r.update()
     print(f"{len(made)} clips cut in {time.monotonic() - began:.0f}s ({len(r.state['clips'])} in all); the broadcast "
-          f"shows each snap {r.state['lag']:.1f}s after ESPN logs the play", flush=True)
+          f"shows each snap {r.state['lag'] or '?'}s after ESPN logs the play", flush=True)
     for level, label in ((2, "highlights"), (1, "scores and turnovers")):
         out = r.join(REVIEW / f"{path.stem} - recap, {label}.mp4", level)
         if out:

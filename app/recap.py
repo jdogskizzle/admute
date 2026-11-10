@@ -37,6 +37,8 @@ GPU = os.environ.get("RECAP_GPU", "0") == "1"      # encode clips with NVENC ins
 # Guide titles of the sports the feed covers, and the feed's name for each.
 LEAGUES = {"NFL Football": "football/nfl", "College Football": "football/college-football"}
 PERIODS = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}
+CAPTIONS = 3      # caption style (3: none in the picture, the player shows them); older clips are cut again
+TAIL = 2.0        # seconds kept after each play, while the result shows
 
 
 def get_json(url):
@@ -128,14 +130,27 @@ def _headline(text, kind):
     return line[:110]
 
 
+def _situation(p, abbr):
+    """What's set up before the play, without its result: "CHI ball · 3rd & 6 at TB 9"."""
+    st = p.get("start", {})
+    team = abbr.get(str(st.get("team", {}).get("id")), "")
+    typ = p.get("type", {}).get("text", "")
+    if typ.startswith("Kickoff") or (not st.get("down") and st.get("yardsToEndzone") == 65):
+        return f"{team} kicks off".strip()
+    dd = st.get("downDistanceText") or ""
+    return f"{team} ball · {dd}" if team and dd else dd or team
+
+
 def key_plays(summary):
     comp = summary["header"]["competitions"][0]
     side = {c["homeAway"]: c["team"]["abbreviation"] for c in comp["competitors"]}
+    abbr = {str(c["team"]["id"]): c["team"]["abbreviation"] for c in comp["competitors"]}
     drives = summary.get("drives", {})
     plays = [p for d in drives.get("previous", []) + ([drives["current"]] if drives.get("current") else [])
              for p in d.get("plays", [])]
-    out, seen = [], set()
+    out, seen, before = [], set(), (0, 0)
     for p in plays:
+        prev, before = before, (p.get("awayScore", before[0]), p.get("homeScore", before[1]))
         k = _kind(p)
         if not k or not p.get("wallclock") or p["id"] in seen:
             continue
@@ -143,9 +158,11 @@ def key_plays(summary):
         kind, level, after = k
         period = p.get("period", {}).get("number", 0)
         when = f"{PERIODS.get(period, 'OT')} {p.get('clock', {}).get('displayValue', '')}".strip()
-        score = f"{side.get('away', '')} {p.get('awayScore', 0)}  {side.get('home', '')} {p.get('homeScore', 0)}"
+        score = f"{side.get('away', '')} {before[0]}  {side.get('home', '')} {before[1]}"
+        earlier = f"{side.get('away', '')} {prev[0]}  {side.get('home', '')} {prev[1]}"
         out.append({"id": p["id"], "wall": datetime.fromisoformat(p["wallclock"].replace("Z", "+00:00")).timestamp(),
-                    "kind": kind, "level": level, "after": round(after, 1), "when": when, "score": score,
+                    "kind": kind, "level": level, "after": round(after + TAIL, 1), "when": when, "score": score,
+                    "before": earlier, "situation": _situation(p, abbr),
                     "text": _headline(p.get("text", ""), kind)})
     return sorted(out, key=lambda x: x["wall"])
 
@@ -259,17 +276,23 @@ def _escape(s):
     return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "’").replace("%", "\\%")
 
 
-def cut(path, start, length, out, caption):
-    """Encode [start, start + length] seconds of the recording into an MP4 with a caption."""
+def cut(path, start, length, out, intro=None, outro=None):
+    """Encode [start, start + length] seconds of the recording into an MP4. With captions,
+    `intro` (two lines, the set-up) shows for the first 5 seconds, `outro` (the result) for
+    the last 3; without, the player shows them (and they can be turned off)."""
     from replay import seek
     off, _, _ = seek(path, max(0.0, start))
     fade = min(0.4, length / 4)
-    lines = [_escape(x) for x in caption]
-    text = (f"drawtext=text='{lines[0]}':x=40:y=h-150:fontsize=h/24:fontcolor=white:box=1:boxcolor=black@0.6:"
-            f"boxborderw=12:enable='lt(t,5)',"
-            f"drawtext=text='{lines[1]}':x=40:y=h-90:fontsize=h/34:fontcolor=white:box=1:boxcolor=black@0.6:"
-            f"boxborderw=10:enable='lt(t,5)'")
-    vf = f"bwdif=1:-1:1,{text},fade=in:d={fade},fade=out:st={length - fade}:d={fade},format=yuv420p"
+    text = ""
+    if intro and outro:
+        a, b = (_escape(x) for x in intro)
+        end = max(5.0, length - 3.0)
+        box = "fontcolor=white:box=1:boxcolor=black@0.6"
+        text = (f"drawtext=text='{a}':x=40:y=h-150:fontsize=h/24:{box}:boxborderw=12:enable='lt(t,5)',"
+            f"drawtext=text='{b}':x=40:y=h-90:fontsize=h/34:{box}:boxborderw=10:enable='lt(t,5)',"
+            f"drawtext=text='{_escape(outro[0])}':x=40:y=h-150:fontsize=h/30:{box}:boxborderw=12:enable='gte(t,{end:.2f})',"
+            f"drawtext=text='{_escape(outro[1])}':x=40:y=h-90:fontsize=h/34:{box}:boxborderw=10:enable='gte(t,{end:.2f})',")
+    vf = f"bwdif=1:-1:1,{text}fade=in:d={fade},fade=out:st={length - fade}:d={fade},format=yuv420p"
     enc = (["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "21", "-b:v", "0"] if GPU else
            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
     tmp = out.with_suffix(".part.mp4")
@@ -354,13 +377,14 @@ class Recap:
             if a < 0 or b > length - 2:
                 continue  # before the recording, or not recorded yet
             old = clips.get(p["id"])
-            if old and (snap is None or (old.get("snap") is not None and abs(old["snap"] - snap) < 1.5)):
+            if old and old.get("captions") == CAPTIONS and \
+                    (snap is None or (old.get("snap") is not None and abs(old["snap"] - snap) < 1.5)):
                 continue
             out = self.work / "clips" / f"{p['id']}.mp4"
             began = time.monotonic()
-            cut(self.path, a, b - a, out, [p["text"], f"{p['when']}   {p['score']}"])
+            cut(self.path, a, b - a, out)
             clips[p["id"]] = {**p, "start": round(a, 2), "end": round(b, 2), "snap": snap and round(snap, 2),
-                              "seen": bool(near), "clip": out.name, "took": round(time.monotonic() - began, 1)}
+                              "seen": bool(near), "captions": CAPTIONS, "clip": out.name, "took": round(time.monotonic() - began, 1)}
             made.append(clips[p["id"]])
             self._save()
             log(f"  {p['when']:9s} {p['kind']:6s} {p['text'][:64]}  ({'snap seen' if near else 'by lag' if lag else 'lag not known yet'}"

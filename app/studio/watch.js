@@ -182,8 +182,10 @@ async function watchView(arg) {
     <div class="tv-col">
       <div class="tv" id="tv" tabindex="0">
         <video id="wv" playsinline></video>
+        <video id="wr" playsinline hidden></video>
         <canvas id="wc"></canvas>
         <div class="tv-msg" id="wmsg">Pick a channel.</div>
+        <div class="tv-cc" id="wcc" hidden></div>
         <div class="tv-top" id="wtop"></div>
         <div class="tv-bar">
           <button class="ghost" id="wplay" title="Play / pause (space)">▶</button>
@@ -197,6 +199,7 @@ async function watchView(arg) {
             <option value="off">Off (browser)</option>
           </select>
           <input type="range" id="wsharp" min="0" max="1" step="0.05" title="Sharpening">
+          <button class="ghost" id="wcap" title="Captions (c)">CC</button>
           <button class="ghost" id="wfs" title="Full screen (f)">⛶</button>
         </div>
       </div>
@@ -207,9 +210,12 @@ async function watchView(arg) {
       <div class="card recaps" id="wrecaps" hidden></div>
     </div>
   </div>`;
-  const tv = $("#tv"), vid = $("#wv"), canvas = $("#wc"), msg = $("#wmsg");
-  const P = Object.assign({ mode: "sharp", sharp: 0.5, volume: 1, muted: false }, WATCH_PREFS);
-  let chans = [], cur = null, up = null, alive = true, frameCb = null, idle, hls = null;
+  // Two players: `live` for the channel and `rv` for recap clips. During a recap the channel
+  // keeps loading (paused, near its newest point), so going back to live is nearly instant.
+  const tv = $("#tv"), live = $("#wv"), rv = $("#wr"), canvas = $("#wc"), msg = $("#wmsg");
+  const V = () => rc ? rv : live;   // the one showing
+  const P = Object.assign({ mode: "sharp", sharp: 0.5, volume: 1, muted: false, cc: false }, WATCH_PREFS);
+  let chans = [], cur = null, up = null, alive = true, frameCb = null, frameEl = null, idle, hls = null;
   let recapList = [], rc = null;   // rc: the recap playing ({name, level, clips, i})
 
   try { up = new Upscaler(canvas); } catch (e) {
@@ -217,15 +223,15 @@ async function watchView(arg) {
     $("#wup").disabled = true; $("#wup").title = "Upscaling needs WebGL 2: " + e.message;
   }
   $("#wup").value = P.mode; $("#wsharp").value = P.sharp; $("#wvol").value = P.volume;
-  vid.volume = P.volume; vid.muted = P.muted;
+  for (const v of [live, rv]) { v.volume = P.volume; v.muted = P.muted; }
 
   const show = m => { msg.textContent = m || ""; msg.hidden = !m; };
-  const upscaling = () => up && P.mode !== "off" && Upscaler.wanted(vid.videoWidth, vid.videoHeight, canvas.width, canvas.height);
+  const upscaling = () => up && P.mode !== "off" && Upscaler.wanted(V().videoWidth, V().videoHeight, canvas.width, canvas.height);
 
   // canvas at the real pixel size of where the picture shows (letterboxed inside the box)
   function layout() {
     const box = tv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
-    const ar = vid.videoWidth && vid.videoHeight ? vid.videoWidth / vid.videoHeight : 16 / 9;
+    const ar = V().videoWidth && V().videoHeight ? V().videoWidth / V().videoHeight : 16 / 9;
     let w = box.width, h = w / ar;
     if (h > box.height) { h = box.height; w = h * ar; }
     Object.assign(canvas.style, { width: w + "px", height: h + "px", left: (box.width - w) / 2 + "px", top: (box.height - h) / 2 + "px" });
@@ -238,22 +244,24 @@ async function watchView(arg) {
   // frames the upscaler missed (it draws once per video frame; a skipped one means too slow).
   const perf = { seen: 0, missed: 0, last: null, since: performance.now(), note: "" };
   function stat() {
-    const w = vid.videoWidth, h = vid.videoHeight;
+    const w = V().videoWidth, h = V().videoHeight;
     if (!w) { $("#wstat").textContent = ""; return; }
-    const parts = [upscaling() ? `${w}×${h} → ${canvas.width}×${canvas.height}` : `${w}×${h}`];
+    const why = !up ? "no upscaling: WebGL 2 unavailable" : P.mode === "off" ? "upscaling off"
+      : `no upscaling needed: shown at ${canvas.width}×${canvas.height}, not bigger than the video`;
+    const parts = [upscaling() ? `upscaling ${w}×${h} → ${canvas.width}×${canvas.height}` : `${w}×${h} (${why})`];
     const lv = hls && hls.levels[hls.currentLevel];
     if (lv) parts.push(`${(lv.bitrate / 1e6).toFixed(0)} Mb/s`);
-    const b = vid.buffered;
-    if (b.length) parts.push(`${Math.max(0, b.end(b.length - 1) - vid.currentTime).toFixed(1)}s buffered`);
-    const q = vid.getVideoPlaybackQuality ? vid.getVideoPlaybackQuality() : null;
+    const b = V().buffered;
+    if (b.length) parts.push(`${Math.max(0, b.end(b.length - 1) - V().currentTime).toFixed(1)}s buffered`);
+    const q = V().getVideoPlaybackQuality ? V().getVideoPlaybackQuality() : null;
     if (q && q.droppedVideoFrames) parts.push(`${q.droppedVideoFrames} dropped`);
     if (perf.note) parts.push(perf.note);
     $("#wstat").textContent = parts.join(" · ");
     $("#wsharp").hidden = !upscaling() || P.mode !== "sharp";
   }
   function paint() {
-    if (upscaling() && vid.readyState >= 2) {
-      try { up.draw(vid, P.mode === "sharp" ? +P.sharp : 0); } catch (e) { console.warn(e); }
+    if (upscaling() && V().readyState >= 2) {
+      try { up.draw(V(), P.mode === "sharp" ? +P.sharp : 0); } catch (e) { console.warn(e); }
     }
   }
   // If the upscaler can't keep up on this device, step down (sharpen → plain → off) for now.
@@ -278,24 +286,76 @@ async function watchView(arg) {
       }
       perf.last = meta.presentedFrames;
     } else perf.last = null;
-    frameCb = vid.requestVideoFrameCallback ? vid.requestVideoFrameCallback(loop) : requestAnimationFrame(loop);
+    frameEl = V();
+    frameCb = frameEl.requestVideoFrameCallback ? frameEl.requestVideoFrameCallback(loop) : requestAnimationFrame(loop);
+  }
+  // after switching players: draw from the other one
+  function rearm() {
+    if (frameCb != null) {
+      if (frameEl && frameEl.cancelVideoFrameCallback) frameEl.cancelVideoFrameCallback(frameCb); else cancelAnimationFrame(frameCb);
+    }
+    frameCb = null; perf.last = null;
+    live.hidden = !!rc; rv.hidden = !rc;
+    caption(null);
+    layout(); loop();
   }
   every(2000, () => { stat(); checkPerf(); });
   const ro = new ResizeObserver(layout); ro.observe(tv);
-  vid.addEventListener("loadedmetadata", layout);
-  vid.addEventListener("resize", layout);
-  vid.addEventListener("playing", () => { show(""); $("#wplay").textContent = "❚❚"; });
-  vid.addEventListener("pause", () => { $("#wplay").textContent = "▶"; });
-  vid.addEventListener("waiting", () => (cur || rc) && show("Buffering…"));
-  vid.addEventListener("error", () => {
-    if (rc) return nextClip();
-    if (cur) show("The channel stopped. Pick it again to retry (maybe no free tuner).");
-  });
-  vid.addEventListener("ended", () => rc && nextClip());
+  for (const v of [live, rv]) {
+    v.addEventListener("loadedmetadata", () => v === V() && layout());
+    v.addEventListener("resize", () => v === V() && layout());
+    v.addEventListener("playing", () => { if (v === V()) { show(""); $("#wplay").textContent = "❚❚"; } });
+    v.addEventListener("pause", () => { if (v === V()) $("#wplay").textContent = "▶"; });
+    v.addEventListener("waiting", () => v === V() && (cur || rc) && show("Buffering…"));
+  }
+  live.addEventListener("error", () => { if (!rc && cur) show("The channel stopped. Pick it again to retry (maybe no free tuner)."); });
+  rv.addEventListener("error", () => rc && nextClip());
+  rv.addEventListener("ended", () => rc && nextClip());
   loop();
 
+  // ---------- captions ----------
+  // Drawn here, above the upscaled picture (the browser would draw them under the canvas).
+  // Live: the broadcast's closed captions. Recap: the set-up at the start of each play, the
+  // result at the end.
+  const ccBox = $("#wcc");
+  function caption(lines) {
+    const text = P.cc && lines ? lines.filter(Boolean).join("\n") : "";
+    if (ccBox.textContent !== text) ccBox.textContent = text;
+    ccBox.hidden = !text;
+  }
+  function liveCaption() {
+    if (rc) return;
+    const cues = [];
+    for (const t of live.textTracks) {
+      if (t.kind !== "captions" && t.kind !== "subtitles") continue;
+      if (t.mode !== "hidden") t.mode = "hidden";   // cues still arrive, the browser doesn't draw them
+      for (const c of t.activeCues || []) cues.push(c.text);
+    }
+    caption(cues.length ? [cues.join("\n")] : null);
+  }
+  live.textTracks.addEventListener("addtrack", e => {
+    e.track.mode = "hidden";
+    e.track.addEventListener("cuechange", liveCaption);
+  });
+  function recapCaption() {
+    if (!rc) return;
+    const c = rc.clips[rc.i], t = rv.currentTime, d = rv.duration;
+    if (!c) return caption(null);
+    if (t < 5) caption([c.situation || c.kind, `${c.when}   ${c.before || ""}`]);
+    else if (d && t >= d - 3) caption([c.text, c.score]);
+    else caption(null);
+  }
+  rv.addEventListener("timeupdate", recapCaption);
+  function setCC(on) {
+    P.cc = on; Object.assign(WATCH_PREFS, P); saveWatchPrefs();
+    $("#wcap").classList.toggle("on", on);
+    rc ? recapCaption() : liveCaption();
+  }
+  $("#wcap").onclick = () => setCC(!P.cc);
+  setCC(P.cc);
+
   // Safari and iPhones play HLS themselves; elsewhere hls.js does it (loaded on first use).
-  const NATIVE = !!vid.canPlayType("application/vnd.apple.mpegurl") && /Apple/.test(navigator.vendor || "");
+  const NATIVE = !!live.canPlayType("application/vnd.apple.mpegurl") && /Apple/.test(navigator.vendor || "");
   function hlsJs() {
     if (window.Hls) return Promise.resolve(window.Hls);
     return new Promise((ok, fail) => {
@@ -304,20 +364,21 @@ async function watchView(arg) {
       document.head.appendChild(el);
     });
   }
-  async function tune(num) {
-    rc = null; vid.loop = false;
+  // quiet: load the channel in the background (during a recap), without playing it
+  async function tune(num, quiet = false) {
+    if (!quiet && rc) stopRecap();
     cur = chans.find(c => c.num === num) || { num, name: num };
     location.replace(`#/watch/${encodeURIComponent(num)}`);
-    show(`Tuning ${cur.num} ${cur.name}… (the picture starts after the ${DELAY_S}s delay)`);
+    if (!quiet) show(`Tuning ${cur.num} ${cur.name}… (the picture starts after the ${DELAY_S}s delay)`);
     drawGuide(); drawInfo();
     const url = `api/watch/${encodeURIComponent(num)}/live.m3u8`;
     if (hls) { hls.destroy(); hls = null; }
     if (NATIVE) {
-      vid.src = url;
+      live.src = url;
     } else {
       const Hls = await hlsJs().catch(e => { show(e.message); return null; });
       if (!Hls || !alive || !cur || cur.num !== num) return;
-      if (!Hls.isSupported()) { vid.src = url; }
+      if (!Hls.isSupported()) { live.src = url; }
       else {
         // About 3 pieces (6s) behind the newest: enough buffer to ride out a slow moment.
         hls = new Hls({ liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 10, maxBufferLength: 20,
@@ -328,14 +389,24 @@ async function watchView(arg) {
           if (!d.fatal) return;
           if (d.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
           else if (d.type === Hls.ErrorTypes.NETWORK_ERROR && retries++ < 3) hls.startLoad();
-          else show("The channel stopped. Pick it again to retry (maybe no free tuner).");
+          else if (!rc) show("The channel stopped. Pick it again to retry (maybe no free tuner).");
         });
         hls.on(Hls.Events.LEVEL_SWITCHED, stat);
         hls.loadSource(url);
-        hls.attachMedia(vid);
+        hls.attachMedia(live);
       }
     }
-    vid.play().catch(() => show("Press play to start."));
+    if (quiet) live.pause();
+    else live.play().catch(() => show("Press play to start."));
+  }
+  // Keep the paused channel near its newest point, so it's ready to play when the recap ends.
+  function primeLive() {
+    if (hls && hls.liveSyncPosition != null) {
+      if (live.currentTime < hls.liveSyncPosition - 4) live.currentTime = hls.liveSyncPosition;
+    } else if (live.seekable && live.seekable.length) {
+      const edge = live.seekable.end(live.seekable.length - 1) - 6;
+      if (live.currentTime < edge - 4) live.currentTime = edge;
+    }
   }
   let DELAY_S = 6;
 
@@ -398,20 +469,34 @@ async function watchView(arg) {
           <div class="dim">${recapSummary(r)}</div></div>
         <div class="row" style="margin:4px 0 0">${recapButtons(r)}</div></div>`).join("");
   }
+  // The channel showing a game now (by the teams in the guide), if any.
+  function channelFor(r) {
+    return r && r.teams && chans.find(c => {
+      const t = c.now && teamsOf(c.now.subtitle);
+      return t && r.teams[0].toLowerCase() === t[0] && r.teams[1].toLowerCase() === t[1];
+    });
+  }
   function startRecap(name, level) {
     const r = recapList.find(x => x.name === name);
     if (!r) return;
     const clips = pick(r, level);
     if (!clips.length) return;
-    if (hls) { hls.destroy(); hls = null; }
-    rc = { name, level, clips, i: -1, from: cur && cur.num };
+    // afterwards: the game's channel if it's still on, else whatever was playing
+    const game = r.live ? channelFor(r) : null;
+    const back = game ? game.num : cur && cur.num;
+    const had = !!rc;
+    rc = { name, level, clips, i: -1, back };
+    live.pause();
+    if (!had) rearm();
+    if (back && (!cur || cur.num !== back || (!hls && !live.src))) tune(back, true);
     nextClip();
   }
   function playClip() {
     const c = rc.clips[rc.i];
     show("");
-    vid.src = `api/recap/${encodeURIComponent(rc.name)}/${encodeURIComponent(c.file)}`;
-    vid.play().catch(() => show("Press play to start."));
+    rv.src = `api/recap/${encodeURIComponent(rc.name)}/${encodeURIComponent(c.file)}`;
+    rv.play().catch(() => show("Press play to start."));
+    if (rc.back) primeLive();
     drawInfo();
   }
   async function nextClip(step = 1) {
@@ -427,25 +512,36 @@ async function watchView(arg) {
     if (rc.i >= rc.clips.length) return endRecap();
     playClip();
   }
-  function endRecap() {
-    const back = rc && rc.from;
+  function stopRecap() {
     rc = null;
-    if (back) tune(back);
-    else { vid.pause(); vid.removeAttribute("src"); vid.load(); show("Recap finished. Pick a channel."); drawInfo(); }
+    rv.pause(); rv.removeAttribute("src"); rv.load();
+    rearm();
+  }
+  function endRecap() {
+    const back = rc && rc.back;
+    stopRecap();
+    if (!back) { show("Recap finished. Pick a channel."); drawInfo(); return; }
+    if (cur && cur.num === back && (hls || live.src)) {
+      primeLive();
+      live.play().catch(() => show("Press play to start."));
+      drawGuide(); drawInfo();
+    } else tune(back);
   }
   function drawRecapInfo() {
     const r = recapList.find(x => x.name === rc.name), c = rc.clips[rc.i];
     if (!c) return;
     const title = r && r.teams ? `${r.teams[0]} at ${r.teams[1]}` : rc.name;
+    // What happened stays hidden until its clip has played: before that, only the set-up.
+    const setup = x => x.situation || x.kind;
     $("#wtop").innerHTML = `<div class="tv-chan"><div><b>Recap</b> <span class="tag">${rc.i + 1} / ${rc.clips.length}</span>
-        <div>${esc(title)} <span class="dim">· ${esc(c.when)} · ${esc(c.score)}</span></div></div></div>`;
-    $("#winfo").innerHTML = `<div class="catchup"><span><b>${esc(c.text)}</b></span>
+        <div>${esc(title)} <span class="dim">· ${esc(c.when)} · ${esc(c.before || "")}</span></div></div></div>`;
+    $("#winfo").innerHTML = `<div class="catchup"><span><b>${esc(setup(c))}</b></span>
         <span class="row" style="margin:0">
           <button class="ghost" id="rprev" title="Previous play (←)">◀ Previous</button>
           <button class="ghost" id="rnext" title="Next play (→)">Next ▶</button>
-          <button id="rlive">${rc.from ? "Back to live" : "Close recap"}</button></span></div>
-      <div class="recap-list">${rc.clips.map((x, i) => `<button class="ghost${i === rc.i ? " on" : ""}" data-clip="${i}">
-        <span class="mono dim">${esc(x.when)}</span> ${esc(x.text)}</button>`).join("")}</div>`;
+          <button id="rlive">${rc.back ? "Back to live" : "Close recap"}</button></span></div>
+      <div class="recap-list">${rc.clips.map((x, i) => `<button class="ghost${i === rc.i ? " on" : ""}${i > rc.i ? " ahead" : ""}" data-clip="${i}">
+        <span class="mono dim">${esc(x.when)}</span> ${esc(i < rc.i ? x.text : setup(x))}</button>`).join("")}</div>`;
     $("#rprev").onclick = () => nextClip(-1);
     $("#rnext").onclick = () => nextClip(1);
     $("#rlive").onclick = endRecap;
@@ -483,20 +579,21 @@ async function watchView(arg) {
   if (arg) tune(decodeURIComponent(arg));
 
   // controls
-  $("#wplay").onclick = () => vid.paused ? (cur ? vid.play() : null) : vid.pause();
-  $("#wmute").onclick = () => { vid.muted = !vid.muted; };
-  vid.addEventListener("volumechange", () => {
-    $("#wmute").textContent = vid.muted || !vid.volume ? "🔇" : "🔊";
-    P.volume = vid.volume; P.muted = vid.muted; saveWatchPrefs();
-  });
-  vid.dispatchEvent(new Event("volumechange"));
-  $("#wvol").oninput = e => { vid.volume = +e.target.value; vid.muted = false; };
+  $("#wplay").onclick = () => { const v = V(); v.paused ? ((cur || rc) ? v.play() : null) : v.pause(); };
+  const setSound = (volume, muted) => {
+    for (const v of [live, rv]) { v.volume = volume; v.muted = muted; }
+    $("#wmute").textContent = muted || !volume ? "🔇" : "🔊";
+    P.volume = volume; P.muted = muted; saveWatchPrefs();
+  };
+  $("#wmute").onclick = () => setSound(P.volume, !P.muted);
+  setSound(P.volume, P.muted);
+  $("#wvol").oninput = e => setSound(+e.target.value, false);
   $("#wup").onchange = e => { perf.note = ""; P.mode = e.target.value; Object.assign(WATCH_PREFS, P); saveWatchPrefs(); layout(); };
   $("#wsharp").oninput = e => { P.sharp = +e.target.value; Object.assign(WATCH_PREFS, P); saveWatchPrefs(); paint(); };
   const fullscreen = () => {
     if (document.fullscreenElement) return document.exitFullscreen();
     if (tv.requestFullscreen) return tv.requestFullscreen();
-    if (vid.webkitEnterFullscreen) vid.webkitEnterFullscreen();   // iPhone: the browser's own player
+    if (V().webkitEnterFullscreen) V().webkitEnterFullscreen();   // iPhone: the browser's own player
   };
   $("#wfs").onclick = fullscreen;
   tv.addEventListener("dblclick", fullscreen);
@@ -508,6 +605,7 @@ async function watchView(arg) {
     if (e.key === " ") { e.preventDefault(); $("#wplay").click(); }
     else if (e.key === "f") fullscreen();
     else if (e.key === "m") $("#wmute").click();
+    else if (e.key === "c") $("#wcap").click();
     else if (rc && (e.key === "ArrowRight" || e.key === "ArrowLeft")) { e.preventDefault(); nextClip(e.key === "ArrowRight" ? 1 : -1); }
     else if ((e.key === "ArrowUp" || e.key === "ArrowDown") && chans.length) {
       e.preventDefault();
@@ -520,8 +618,8 @@ async function watchView(arg) {
     alive = false;
     ro.disconnect();
     document.removeEventListener("keydown", keys);
-    if (frameCb != null && vid.cancelVideoFrameCallback) vid.cancelVideoFrameCallback(frameCb);
+    if (frameCb != null && frameEl && frameEl.cancelVideoFrameCallback) frameEl.cancelVideoFrameCallback(frameCb);
     if (hls) hls.destroy();
-    vid.pause(); vid.removeAttribute("src"); vid.load();   // lets the tuner go
+    for (const v of [live, rv]) { v.pause(); v.removeAttribute("src"); v.load(); }   // lets the tuner go
   };
 }

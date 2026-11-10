@@ -583,7 +583,7 @@ def watch_cmd(num, out):
         graph = "[0:v:0]bwdif_cuda=1:-1:1,split=2[hi][x];[x]scale_cuda=-2:'min(720,ih)'[lo]"
         venc = ["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq", "-rc", "vbr", "-bf", "3",
                 "-spatial-aq", "1", "-temporal-aq", "1", "-rc-lookahead", "20",
-                "-cq:v:0", "19", "-cq:v:1", "23"]
+                "-cq:v:0", "19", "-cq:v:1", "23", "-a53cc", "1"]   # keep the closed captions
     else:
         hw = []
         graph = "[0:v:0]bwdif=1:-1:1,split=2[hi][x];[x]scale=-2:'min(720,ih)'[lo]"
@@ -711,7 +711,8 @@ def recaps():
         clips = sorted(st["clips"].values(), key=lambda c: c["wall"])
         out.append({"name": d.parent.name, "title": rec.stem, "teams": teams, "live": live,
                     "updated": d.stat().st_mtime, "lag": st.get("lag"),
-                    "clips": [{k: c[k] for k in ("id", "kind", "level", "when", "score", "text", "wall")}
+                    "clips": [{k: c.get(k) for k in ("id", "kind", "level", "when", "score", "text", "wall",
+                                                     "situation", "before")}
                               | {"seconds": round(c["end"] - c["start"], 1), "file": c["clip"]} for c in clips]})
     return sorted(out, key=lambda r: -r["updated"])
 

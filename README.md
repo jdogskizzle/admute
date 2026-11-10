@@ -108,6 +108,16 @@ The `studio` service is a web dashboard for checking and tuning the detector on 
   seconds of game muted, wrong mutes, late starts. "Score all reviewed recordings" checks the
   settings across every game, so tuning one game doesn't break another. It shows the lines to
   put in `docker-compose.yaml` when you find better values.
+- **Watch**: the admute channels live, as Jellyfin gets them (muted, `DELAY` behind), with
+  the channel and what's on now and next from the guide. The picture is deinterlaced to 60
+  frames a second and sent as HLS in two versions, the broadcast's size at up to `WATCH_MBPS`
+  (default 20) and 720p at 5 Mb/s; the player (hls.js, or Safari's own) switches between
+  them as the connection allows, about 6 seconds behind the newest piece. The browser
+  upscales to the screen's real pixels (Lanczos-3 with anti-ringing, then AMD's RCAS
+  sharpening from FSR 1, in WebGL 2; "Off" leaves it to the browser), stepping down by itself
+  if the device can't keep up. The bar shows size, bitrate, buffer and dropped frames. One
+  channel at a time; it stops 20 seconds after the player goes away, freeing the tuner. Keys:
+  space, m, f, ↑/↓ for channels.
 - **Sounds**: what the commentary says and which sounds come back (see Listening below).
   Sponsor reads found in the game, to mark Mute or Keep, and sounds heard more than once with
   a guess at what they are (jingle at a break's edge, network promo that ends breaks, ad,
@@ -133,6 +143,7 @@ detector only looks DELAY seconds ahead, like live, so results match what live T
 ./replay train                                        # learn the scene check from reviewed games
 ./replay listen path/to/recording.ts                  # transcribe + fingerprint the sound (GPU)
 ./replay sounds                                       # sponsor reads and repeated sounds, all recordings
+./replay recap path/to/recording.ts                   # the game's key plays, cut into a recap
 ```
 - survey writes to `data/replay/<name>/`: `breaks.txt` and `result.json` (what would be muted),
   `trace.npz` (per-frame scores, for tuning in the studio), `timeline.csv` (per second),
@@ -143,9 +154,33 @@ detector only looks DELAY seconds ahead, like live, so results match what live T
   video decoder); `REPLAY_GPU=1` uses the GPU.
 - render uses the logo the survey learned and writes the clip to the review folder
   (mounted at `/review` in docker-compose.yaml).
-- listen and sounds: see Listening below.
+- listen and sounds: see Listening below. recap: see Rapid recap below.
 - Recordings must be inside a folder mounted in docker-compose.yaml; `./replay` translates
   host paths to container paths from those mounts.
+
+## Rapid recap
+The key plays of a football game so far, cut from its recording while the game is on, so
+catching up starts at once. The studio keeps the recap of every game being recorded up to
+date (every `RECAP_EVERY` seconds, default 20); `./replay recap` makes one from any
+recording, and also writes it to the review folder as two MP4s (all highlights; scores and
+turnovers).
+- **Which plays**: from ESPN's public play-by-play (`RECAP_FEED`), matched to the recording by
+  the teams in its name. Scores, turnovers and missed kicks; also sacks, gains of 20+ yards
+  and long returns. Overturned calls go by the final ruling.
+- **When**: ESPN logs each play with a wall-clock time. The recording's own clock (its last
+  write, minus its length) says where that falls in the file. The broadcast shows the snap
+  some seconds later, and how many differs by game (about 22 s on NBC, 16 s on FOX and CBS in
+  the games so far). So each play's snap is looked for in the picture (a still wide shot of the
+  field, then everything moving at once), and the plays where it's clear set the game's lag
+  for the rest. Clips run from `RECAP_PRE` (4) seconds before the snap to the end of the
+  play, longer for long gains and scores, with a caption at the start. A clip whose snap
+  moves as the lag becomes clearer is cut again.
+- Clips are H.264 at the broadcast's size, encoded on the CPU (a few seconds each;
+  `RECAP_GPU=1` uses NVENC). They're kept in `data/recap/<name>/`.
+- In the Watch tab: **Catch up** under the player when the channel's game has a recap, and a
+  list of every game's recap beside the guide. Clips play one after another (upscaled like
+  live), plays added meanwhile are picked up, and it goes back to live at the end. ← and →
+  move between plays. `RECAP=0` turns the studio's recap maker off.
 
 ## Listening (sponsor reads, jingles, promos)
 **Live:** during sports (programs the guide calls sports; renders of recordings too), each

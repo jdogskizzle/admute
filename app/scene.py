@@ -141,14 +141,15 @@ def covers(classifier, title):
 
 
 class Guide:
-    """Whether a sports event is on a channel now, from an XMLTV guide (GUIDE_XMLTV). The scene
-    check was learned from games, so live TV only uses it during programs the guide calls
-    sports (and for a while after, since games run long)."""
+    """What's on each channel, from an XMLTV guide (GUIDE_XMLTV): for the studio's player, and
+    whether a sports event is on. The scene check was learned from games, so live TV only
+    uses it during programs the guide calls sports (and for a while after, since games run long)."""
 
     GRACE = 30 * 60  # seconds after a sports program's scheduled end
 
     def __init__(self, path):
         self.path, self.loaded, self.mtime, self.sports = path, 0.0, None, {}
+        self.programs, self.icons = {}, {}   # every program per channel (sorted), channel logos
 
     def _load(self):
         import time
@@ -161,13 +162,25 @@ class Guide:
             mtime = os.path.getmtime(self.path)
             if mtime == self.mtime:
                 return
-            sports = {}
-            for p in ET.parse(self.path).getroot().iter("programme"):
-                if any((c.text or "").strip().lower() == "sports" for c in p.findall("category")):
-                    a = datetime.strptime(p.get("start"), "%Y%m%d%H%M%S %z").timestamp()
-                    b = datetime.strptime(p.get("stop"), "%Y%m%d%H%M%S %z").timestamp()
-                    sports.setdefault(p.get("channel"), []).append((a, b, (p.findtext("title") or "").strip()))
-            self.sports, self.mtime = sports, mtime
+            sports, programs, icons = {}, {}, {}
+            root = ET.parse(self.path).getroot()
+            for c in root.iter("channel"):
+                icon = c.find("icon")
+                if icon is not None and icon.get("src"):
+                    icons[c.get("id")] = icon.get("src")
+            for p in root.iter("programme"):
+                a = datetime.strptime(p.get("start"), "%Y%m%d%H%M%S %z").timestamp()
+                b = datetime.strptime(p.get("stop"), "%Y%m%d%H%M%S %z").timestamp()
+                cats = [(c.text or "").strip() for c in p.findall("category")]
+                title = (p.findtext("title") or "").strip()
+                programs.setdefault(p.get("channel"), []).append({
+                    "start": a, "stop": b, "title": title, "subtitle": (p.findtext("sub-title") or "").strip(),
+                    "desc": (p.findtext("desc") or "").strip(), "categories": cats})
+                if any(c.lower() == "sports" for c in cats):
+                    sports.setdefault(p.get("channel"), []).append((a, b, title))
+            for v in programs.values():
+                v.sort(key=lambda x: x["start"])
+            self.sports, self.programs, self.icons, self.mtime = sports, programs, icons, mtime
         except Exception as exc:
             log.warning("couldn't read the guide %s: %s", self.path, exc)
 
@@ -177,6 +190,19 @@ class Guide:
         self._load()
         on = sorted(((a, t) for a, b, t in self.sports.get(str(channel), []) if a <= now < b + self.GRACE), reverse=True)
         return [t for a, t in on]
+
+
+    def now_next(self, channel, now):
+        """The program on now and the one after it (None where the guide has nothing)."""
+        self._load()
+        progs = self.programs.get(str(channel), [])
+        cur = next((x for x in progs if x["start"] <= now < x["stop"]), None)
+        nxt = next((x for x in progs if x["start"] >= (cur["stop"] if cur else now)), None)
+        return cur, nxt
+
+    def icon(self, channel):
+        self._load()
+        return self.icons.get(str(channel), "")
 
 
 _guide = None

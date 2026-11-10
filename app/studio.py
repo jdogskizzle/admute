@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -562,6 +563,169 @@ class HlsMaker:
 HLS = HlsMaker()
 
 
+# --- watching live TV -------------------------------------------------------------
+# The proxy's output (muted, DELAY behind) as HLS in two versions: the broadcast's own size
+# (1080 or 720 lines) at high quality, and 720p at about 5 Mb/s for slower connections; the
+# player picks between them as the connection allows. Deinterlaced to 60 frames a second
+# (sports on 1080i channels) and not enlarged: the player upscales on the viewer's side.
+# One channel at a time, since each one holds a tuner.
+
+LIVE_TMP = Path(os.environ.get("HLS_TMP", "/tmp")) / "admute-live"
+LIVE_SEG = 2
+WATCH_MBPS = float(os.environ.get("WATCH_MBPS", "20"))   # the full-quality version's peak bitrate
+
+
+def watch_cmd(num, out):
+    from urllib.parse import quote
+    src = f"{LIVE_URL}/stream/{quote(num, safe='')}"
+    if GPU:
+        hw = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        graph = "[0:v:0]bwdif_cuda=1:-1:1,split=2[hi][x];[x]scale_cuda=-2:'min(720,ih)'[lo]"
+        venc = ["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq", "-rc", "vbr", "-bf", "3",
+                "-spatial-aq", "1", "-temporal-aq", "1", "-rc-lookahead", "20",
+                "-cq:v:0", "19", "-cq:v:1", "23"]
+    else:
+        hw = []
+        graph = "[0:v:0]bwdif=1:-1:1,split=2[hi][x];[x]scale=-2:'min(720,ih)'[lo]"
+        venc = ["-c:v", "libx264", "-preset", "veryfast", "-crf:v:0", "19", "-crf:v:1", "23"]
+    rates = ["-b:v:0", f"{WATCH_MBPS * 0.8:g}M", "-maxrate:v:0", f"{WATCH_MBPS:g}M", "-bufsize:v:0", f"{WATCH_MBPS * 1.6:g}M",
+             "-b:v:1", "4M", "-maxrate:v:1", "5M", "-bufsize:v:1", "10M"]
+    return [FFMPEG, "-hide_banner", "-loglevel", "error", "-fflags", "+discardcorrupt+genpts", *hw,
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "4", "-i", src,
+            "-filter_complex", graph, "-map", "[hi]", "-map", "[lo]", "-map", "0:a:0", "-map", "0:a:0",
+            *venc, *rates, "-g", "120", "-force_key_frames", f"expr:gte(t,n_forced*{LIVE_SEG})",
+            "-c:a", "aac", "-ac", "2", "-b:a", "192k",
+            "-f", "hls", "-hls_time", str(LIVE_SEG), "-hls_list_size", "10",
+            "-hls_flags", "delete_segments+temp_file+independent_segments",
+            "-var_stream_map", "v:0,a:0 v:1,a:1", "-master_pl_name", "live.m3u8",
+            "-hls_segment_filename", str(out / "%v" / "%d.ts"), str(out / "%v" / "index.m3u8")]
+
+
+class LiveTV:
+    """The one live channel being converted."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc, self.num, self.seen = None, None, 0.0
+        threading.Thread(target=self._idle, daemon=True).start()
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        self.proc = self.num = None
+
+    def playlist(self, num):
+        """The top playlist (listing both versions), once the first pieces are ready."""
+        with self.lock:
+            self.seen = time.monotonic()
+            if self.num != num or self.proc is None or self.proc.poll() is not None:
+                self.stop()
+                shutil.rmtree(LIVE_TMP, ignore_errors=True)
+                LIVE_TMP.mkdir(parents=True, exist_ok=True)
+                self.proc = subprocess.Popen(watch_cmd(num, LIVE_TMP), stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.num = num
+        deadline = time.monotonic() + 30   # the proxy holds DELAY seconds before sending anything
+        while time.monotonic() < deadline:
+            try:
+                if (LIVE_TMP / "0" / "index.m3u8").read_text().count("#EXTINF") >= 2:
+                    return (LIVE_TMP / "live.m3u8").read_text()
+            except FileNotFoundError:
+                pass
+            if self.proc is None or self.proc.poll() is not None:
+                return None
+            time.sleep(0.2)
+        return None
+
+    def file(self, num, version, name):
+        """A version's playlist or one of its pieces (None when gone or another channel's)."""
+        self.seen = time.monotonic()
+        if num != self.num:
+            return None
+        try:
+            return (LIVE_TMP / version / name).read_bytes()
+        except FileNotFoundError:
+            return None
+
+    def _idle(self):
+        while True:
+            time.sleep(5)
+            with self.lock:
+                if self.proc and time.monotonic() - self.seen > 20:   # the player went away
+                    self.stop()
+
+
+LIVE_TV = LiveTV()
+
+
+# --- rapid recap ------------------------------------------------------------------------
+# While a game is being recorded, its key plays are cut into a recap as they happen (see
+# recap.py), so catching up in the Watch tab starts at once. Only football with ESPN data.
+
+RECAPS = REPLAY.parent / "recap"
+RECAP_EVERY = float(os.environ.get("RECAP_EVERY", "20"))   # seconds between looks at the feed
+
+
+class RecapMaker:
+    def __init__(self):
+        self.errors = {}
+        if os.environ.get("RECAP", "1") == "1":
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        import recap
+        while True:
+            now = time.time()
+            for p in RECORDINGS.rglob("*.ts"):
+                try:
+                    if now - p.stat().st_mtime > 90 or not recap.league_of(p.stem) or not recap.teams_of(p.stem):
+                        continue   # not being recorded now, or not a game the feed covers
+                    r = recap.Recap(p, RECAPS / slug(p))
+                    r.update(log=lambda m, n=p.stem: print(f"recap {n}: {m.strip()}", flush=True))
+                    self.errors.pop(p.stem, None)
+                except Exception as e:
+                    if self.errors.get(p.stem) != str(e):
+                        print(f"recap {p.stem}: {e}", flush=True)
+                    self.errors[p.stem] = str(e)
+            time.sleep(RECAP_EVERY)
+
+
+RECAP_MAKER = RecapMaker()
+
+
+def recaps():
+    """Every recap, newest first, with its clips in order."""
+    import recap
+    out = []
+    for d in RECAPS.glob("*/recap.json"):
+        st = read_json(d)
+        if not st or not st.get("clips"):
+            continue
+        rec = Path(st["recording"])
+        try:
+            live = time.time() - rec.stat().st_mtime < 90
+        except OSError:
+            live = False
+        teams = recap.teams_of(rec.stem)
+        clips = sorted(st["clips"].values(), key=lambda c: c["wall"])
+        out.append({"name": d.parent.name, "title": rec.stem, "teams": teams, "live": live,
+                    "updated": d.stat().st_mtime, "lag": st.get("lag"),
+                    "clips": [{k: c[k] for k in ("id", "kind", "level", "when", "score", "text", "wall")}
+                              | {"seconds": round(c["end"] - c["start"], 1), "file": c["clip"]} for c in clips]})
+    return sorted(out, key=lambda r: -r["updated"])
+
+
+def channels():
+    if not LIVE_URL:
+        return {"configured": False, "channels": []}
+    try:
+        with urllib.request.urlopen(LIVE_URL + "/channels", timeout=5) as r:
+            return {"configured": True, **json.loads(r.read())}
+    except Exception as e:
+        return {"configured": True, "channels": [], "error": str(e)}
+
+
 # --- live --------------------------------------------------------------------------
 
 def live():
@@ -584,7 +748,7 @@ def live():
 
 # --- web ---------------------------------------------------------------------------
 
-STATIC = {"app.js": "text/javascript", "style.css": "text/css", "index.html": "text/html; charset=utf-8"}
+STATIC = {"app.js": "text/javascript", "watch.js": "text/javascript", "hls.min.js": "text/javascript", "style.css": "text/css", "index.html": "text/html; charset=utf-8"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -599,6 +763,41 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    def send_file(self, path, ctype):
+        """A file, with byte ranges (Safari won't play video without them)."""
+        size = path.stat().st_size
+        start, end = 0, size - 1
+        m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start, end = int(m.group(1)), min(int(m.group(2) or size - 1), size - 1)
+            else:
+                start = max(0, size - int(m.group(2)))
+            if start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+        self.send_response(206 if m and (m.group(1) or m.group(2)) else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if m and (m.group(1) or m.group(2)):
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Cache-Control", "private, max-age=3600")
+        for k, v in formlogin.SECURITY_HEADERS:
+            self.send_header(k, v)
+        self.end_headers()
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = end - start + 1
+                while left > 0 and (chunk := f.read(min(left, 1 << 20))):
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_GET(self):
         url = urlsplit(self.path)
@@ -621,6 +820,27 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, JOBS.list())
         if path == "/api/live":
             return self.send(200, live())
+        if path == "/api/recaps":
+            return self.send(200, recaps())
+        m = re.fullmatch(r"/api/recap/([\w.-]+)/([\w-]+\.mp4)", path)
+        if m:
+            f = RECAPS / m.group(1) / "clips" / m.group(2)
+            return self.send_file(f, "video/mp4") if f.is_file() else self.send(404, {"error": "no such clip"})
+        if path == "/api/channels":
+            return self.send(200, channels())
+        m = re.fullmatch(r"/api/watch/([\w.-]+)/(?:live\.m3u8|([01])/(index\.m3u8|\d+\.ts))", path)
+        if m and LIVE_URL:
+            num = m.group(1)
+            if m.group(2):
+                body = LIVE_TV.file(num, m.group(2), m.group(3))
+                if body is None:
+                    return self.send(404, {"error": "gone"})
+                kind = "application/vnd.apple.mpegurl" if m.group(3).endswith("m3u8") else "video/mp2t"
+                return self.send(200, body, kind)
+            text = LIVE_TV.playlist(num)
+            if text is None:
+                return self.send(503, {"error": "the channel didn't start (no free tuner?)"})
+            return self.send(200, text.encode(), "application/vnd.apple.mpegurl")
         if path == "/api/layouts":
             return self.send(200, layouts())
         if path == "/api/sounds":

@@ -74,6 +74,7 @@ function route() {
   if (view === "rec" && arg) return recView(decodeURIComponent(arg));
   if (view === "review" && arg) return reviewView(decodeURIComponent(arg));
   if (view === "live") return liveView();
+  if (view === "watch") return watchView(arg);
   if (view === "sounds") return soundsView();
   if (view === "jobs") return jobsView();
   return listView();

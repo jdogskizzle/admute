@@ -262,6 +262,20 @@ async def stream(request):
     return resp
 
 
+async def channels(request):
+    """The channels with what's on now and next, for the studio's player."""
+    import scene
+    g, now, out = scene.guide(), time.time(), []
+    sessions = request.app["sessions"]
+    for c in await lineup(request.app["http"]):
+        cur, nxt = g.now_next(c["id"], now) if g else (None, None)
+        sess = sessions.get(c["num"])
+        out.append({"num": c["num"], "name": c["name"], "logo": c["logo"] or (g.icon(c["id"]) if g else ""),
+                    "now": cur, "next": nxt, "open": sess is not None,
+                    "muted_now": bool(sess and sess.pipe.muting)})
+    return web.json_response({"channels": out, "delay_seconds": DELAY})
+
+
 async def status(request):
     return web.json_response({
         "delay_seconds": DELAY, "channels": CHANNELS,
@@ -299,6 +313,7 @@ def main():
     app.router.add_get("/lineup.m3u", m3u)
     app.router.add_get("/stream/{num}", stream)
     app.router.add_get("/status", status)
+    app.router.add_get("/channels", channels)
     app.router.add_get("/mute/{num}", mute)
     app.on_startup.append(startup)
     app.on_cleanup.append(cleanup)

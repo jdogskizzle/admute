@@ -594,7 +594,8 @@ def watch_cmd(num, out):
             "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "4", "-i", src,
             "-filter_complex", graph, "-map", "[hi]", "-map", "[lo]", "-map", "0:a:0", "-map", "0:a:0",
             *venc, *rates, "-g", "120", "-force_key_frames", f"expr:gte(t,n_forced*{LIVE_SEG})",
-            "-c:a", "aac", "-ac", "2", "-b:a", "192k",
+            # a reception dropout loses audio frames: fill the gap with silence, keeping sync
+            "-af", "aresample=async=1", "-c:a", "aac", "-ac", "2", "-b:a", "192k",
             "-f", "hls", "-hls_time", str(LIVE_SEG), "-hls_list_size", "10",
             "-hls_flags", "delete_segments+temp_file+independent_segments",
             "-var_stream_map", "v:0,a:0 v:1,a:1", "-master_pl_name", "live.m3u8",

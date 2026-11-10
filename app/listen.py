@@ -46,6 +46,12 @@ def audio(path):
 _model = None
 
 
+def drop():
+    """Forget the loaded model (after a GPU error), so the next use loads it afresh."""
+    global _model
+    _model = None
+
+
 def model():
     global _model
     if _model is None:

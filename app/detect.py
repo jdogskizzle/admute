@@ -523,6 +523,7 @@ class AdDetector:
         # Live TV: only during sports, per the guide. Recordings for the studio are games.
         # Recordings: the title from the file name. Only programs the classifier learned from use it.
         self.live, self._sports_at = live, 0.0
+        self._listen_off_until = 0.0   # after speech-to-text fails, wait before trying again
         self._sports = not live and scene_mod.covers(self.classifier, title or scene_mod.show_title(name))
         self.listener = None
         if not live and not trace:   # renders of recordings (games); surveys don't need it
@@ -631,7 +632,7 @@ class AdDetector:
     def _listen(self, on):
         """Start or stop listening for sponsor billboards (sports only)."""
         import listen
-        on = on and bool(SPEECH) and os.path.isdir(listen.SPEECH_MODEL)
+        on = on and bool(SPEECH) and os.path.isdir(listen.SPEECH_MODEL) and time.monotonic() >= self._listen_off_until
         if on and self.listener is None:
             self.listener = listen.Listener(AUDIO_RATE, lambda: self.now(), _env("DELAY", 10), self._event,
                                             self.fmt, sync=not self.live)
@@ -646,9 +647,13 @@ class AdDetector:
             try:
                 self.listener.audio(t, samples, self.intervals)
             except Exception as exc:
-                log.warning("%s: speech-to-text failed, no longer listening: %s", self.num, exc)
+                # e.g. the GPU ran out of memory (it's shared): try again in 10 minutes, fresh
+                log.warning("%s: speech-to-text failed, trying again in 10 minutes: %s", self.num, exc)
                 self.listener.close()
                 self.listener = None
+                self._listen_off_until = time.monotonic() + 600
+                import listen
+                listen.drop()
         n = AUDIO_RATE // 10
         for i in range(0, len(samples) - n + 1, n):
             w = samples[i:i + n].astype(np.float32)

@@ -115,8 +115,9 @@ The `studio` service is a web dashboard for checking and tuning the detector on 
   them as the connection allows, about 6 seconds behind the newest piece. The browser
   upscales to the screen's real pixels (Lanczos-3 with anti-ringing, then AMD's RCAS
   sharpening from FSR 1, in WebGL 2; "Off" leaves it to the browser), stepping down by itself
-  if the device can't keep up. The bar shows size, bitrate, buffer and dropped frames. One
-  channel at a time; it stops 20 seconds after the player goes away, freeing the tuner. Keys:
+  if the device can't keep up. The bar shows size, bitrate, buffer and dropped frames, and why
+  upscaling is off when it is. CC shows the broadcast's closed captions (drawn by the page,
+  above the upscaled picture; c toggles). One channel at a time; it stops 20 seconds after the player goes away, freeing the tuner. Keys:
   space, m, f, ↑/↓ for channels.
 - **Sounds**: what the commentary says and which sounds come back (see Listening below).
   Sponsor reads found in the game, to mark Mute or Keep, and sounds heard more than once with
@@ -173,15 +174,20 @@ turnovers).
   28 s on ESPN's Monday night game so far). So each play's snap is looked for in the picture
   (a still wide shot of the field, then everything moving at once; or a cut into a wide shot
   that's already moving, as ESPN does), and once three plays show one, they set the game's lag
-  for the rest. Until then clips cover 12-28 s after ESPN's time, and are cut again after. Clips run from `RECAP_PRE` (4) seconds before the snap to the end of the
-  play, longer for long gains and scores, with a caption at the start. A clip whose snap
-  moves as the lag becomes clearer is cut again.
+  for the rest. Until then clips cover 12-28 s after ESPN's time, and are cut again after.
+  Clips run from `RECAP_PRE` (4) seconds before the snap to 2 seconds past the end of the
+  play, longer for long gains and scores. A clip whose snap moves as the lag becomes clearer
+  is cut again.
 - Clips are H.264 at the broadcast's size, encoded on the CPU (a few seconds each;
   `RECAP_GPU=1` uses NVENC). They're kept in `data/recap/<name>/`.
 - In the Watch tab: **Catch up** under the player when the channel's game has a recap, and a
   list of every game's recap beside the guide. Clips play one after another (upscaled like
-  live), plays added meanwhile are picked up, and it goes back to live at the end. ← and →
-  move between plays. `RECAP=0` turns the studio's recap maker off.
+  live) and plays added meanwhile are picked up. Nothing gives a play away before it's
+  shown: captions (CC) show the set-up first ("CHI ball · 3rd & 8 at CHI 44", the score
+  before) and the result only in the last seconds, and the list shows results only for plays
+  already watched. While a live game's recap plays, its channel loads in the background, and
+  the player switches to it at the end. ← and → move between plays. `RECAP=0` turns the
+  studio's recap maker off.
 
 ## Listening (sponsor reads, jingles, promos)
 **Live:** during sports (programs the guide calls sports; renders of recordings too), each

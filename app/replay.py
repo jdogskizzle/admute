@@ -6,6 +6,8 @@
   replay listen REC                 transcribe the commentary and fingerprint the sound (GPU)
   replay sounds                     find sponsor reads and repeated sounds (jingles, promos,
                                     ads) in every listened-to recording
+  replay recap REC                  cut the game's key plays (from ESPN's play-by-play) into a
+                                    recap in the review library
 
 START and LENGTH are like 1:20:00 and 10:00. REC is a path inside the container; the ./replay
 wrapper translates host paths using the volumes in docker-compose.yaml.
@@ -78,17 +80,27 @@ def pcrs(data):
     return out
 
 
+PCR_WRAP = (1 << 33) / 90000.0   # the PCR clock starts again from 0 after about 26.5 hours
+
+
+def since(t, origin):
+    """Seconds from origin to t on the PCR clock, across a wrap."""
+    return (t - origin) % PCR_WRAP
+
+
 class PcrClock:
     """Seconds since the start of the recording, from the stream's PCR. Smooths over wraps and splices."""
 
     def __init__(self, origin, pid):
-        self.pid, self.last, self.offset, self.t = pid, None, -origin, 0.0
+        self.pid, self.origin, self.last, self.offset, self.t = pid, origin, None, 0.0, 0.0
 
     def update(self, data):
         for pid, v in pcrs(data):
             if pid != self.pid:
                 continue
-            if self.last is not None and not -1 < v - self.last < 5:
+            if self.last is None:
+                self.offset = since(v, self.origin) - v   # the first one (maybe past a wrap)
+            elif not -1 < v - self.last < 5:
                 self.offset += self.last - v + 0.04
             self.last = v
             self.t = v + self.offset
@@ -120,12 +132,12 @@ def seek(path, target):
         if origin is None:
             sys.exit("no PCR timestamps in this file; is it an MPEG-TS recording?")
         _, last = pcr_at(f, max(0, size - PKT * 8000))
-        rate = size / max(1.0, last - origin)
+        rate = size / max(1.0, since(last, origin))
         off = int(target * rate)
         for _ in range(6):
             off = min(max(0, off), size - PKT * 8000)
             _, here = pcr_at(f, off)
-            err = target - (here - origin)
+            err = target - since(here, origin)
             if abs(err) < 0.5:
                 break
             off += int(err * rate)
@@ -602,6 +614,24 @@ def sounds(args):
     print(f"{len(out)} repeated sounds: " + ", ".join(f"{v} {k}" for k, v in sorted(kinds.items())), flush=True)
 
 
+def recap(args):
+    from recap import Recap
+    path = Path(args.recording)
+    work = DATA.parent / "recap" / (args.name or slug(path))
+    r = Recap(path, work)
+    print(f"Recap of {path.stem}", flush=True)
+    began = time.monotonic()
+    made = r.update()
+    print(f"{len(made)} clips cut in {time.monotonic() - began:.0f}s ({len(r.state['clips'])} in all); the broadcast "
+          f"shows each snap {r.state['lag']:.1f}s after ESPN logs the play", flush=True)
+    for level, label in ((2, "highlights"), (1, "scores and turnovers")):
+        out = r.join(REVIEW / f"{path.stem} - recap, {label}.mp4", level)
+        if out:
+            n = len(r.playlist(level))
+            secs = sum(c["end"] - c["start"] for c in r.playlist(level))
+            print(f"Wrote {out.name}: {n} plays, {hms(secs)}", flush=True)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="  %(message)s")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -623,7 +653,12 @@ def main():
     li.add_argument("--name")
     li.add_argument("--prints", action="store_true", help="only redo the fingerprints")
     sub.add_parser("sounds", help="find sponsor reads and repeated sounds in listened-to recordings")
+    rc = sub.add_parser("recap", help="cut the game's key plays into a recap")
+    rc.add_argument("recording")
+    rc.add_argument("--name")
     args = ap.parse_args()
+    if args.cmd == "recap":
+        return recap(args)
     if args.cmd == "listen":
         return listen(args)
     if args.cmd == "sounds":

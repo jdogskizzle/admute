@@ -250,3 +250,31 @@ button.link { background: none; border: none; padding: 0; text-decoration: under
 .ch-now, .ch-next { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
 .ch-next { font-size: 12px; }
 @media (max-width: 600px) { .tv-bar input[type=range]#wsharp, .tv-bar .dim { display: none; } }
+
+/* multi-view */
+.multi { display: flex; flex-direction: column; gap: 10px; }
+.multi:fullscreen { background: #000; padding: 10px; justify-content: center; }
+.multi:fullscreen .mv-help { display: none; }
+.multi:fullscreen .mv-bar { background: #111; color: #ddd; border-color: #333; }
+.mv-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.mv-bar .grow { flex: 1; }
+.mv-bar input[type=range] { width: 90px; accent-color: var(--accent); }
+.mv-bar #mvcap.on { color: var(--accent); border-color: var(--accent); }
+.mv-slot { display: flex; align-items: center; gap: 6px; }
+.mv-slot select { max-width: 260px; }
+.mv-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 1fr); gap: 8px; align-items: start; }
+.mv-grid.solo { grid-template-columns: minmax(0, 1fr); }
+.mv-tile { position: relative; grid-column: 2; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden;
+  cursor: pointer; outline: 2px solid transparent; outline-offset: -2px; }
+.mv-tile.focus { grid-column: 1; cursor: default; outline-color: var(--accent); }
+.mv-tile video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.mv-label { position: absolute; left: 0; right: 0; top: 0; padding: 8px 10px 18px; color: #fff; font-size: 13px;
+  background: linear-gradient(rgba(0,0,0,.65), transparent); text-shadow: 0 1px 2px #000; pointer-events: none; }
+.mv-label .tag { background: rgba(0,0,0,.45); margin-left: 4px; font-size: 11px; }
+.mv-now { color: #ccc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mv-tile:not(.focus) .mv-now { display: none; }
+.mv-help { margin: 0; font-size: 12px; }
+@media (max-width: 700px) {
+  .mv-grid { grid-template-columns: minmax(0, 1fr); }
+  .mv-tile, .mv-tile.focus { grid-column: 1; grid-row: auto !important; }
+}

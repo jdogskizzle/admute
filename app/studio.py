@@ -568,7 +568,7 @@ HLS = HlsMaker()
 # (1080 or 720 lines) at high quality, and 720p at about 5 Mb/s for slower connections; the
 # player picks between them as the connection allows. Deinterlaced to 60 frames a second
 # (sports on 1080i channels) and not enlarged: the player upscales on the viewer's side.
-# One channel at a time, since each one holds a tuner.
+# Each channel holds a tuner: the single player watches one, the multi-view up to one per tuner.
 
 LIVE_TMP = Path(os.environ.get("HLS_TMP", "/tmp")) / "admute-live"
 LIVE_SEG = 2
@@ -602,50 +602,118 @@ def watch_cmd(num, out):
             "-hls_segment_filename", str(out / "%v" / "%d.ts"), str(out / "%v" / "index.m3u8")]
 
 
+class Conversion:
+    """One channel being converted, with the clock time each piece reached the proxy's viewers.
+
+    A piece's file is written as soon as its last frame arrives (plus a fraction of a second
+    to encode it), so its time minus how far into the stream it ends gives when the stream
+    started; the smallest over the last minute is used (pieces made while catching up come
+    out late). The playlists carry these times, which the multi-view lines up with the
+    proxy's break times."""
+
+    def __init__(self, num):
+        self.num, self.dir = num, LIVE_TMP / re.sub(r"[^\w.-]", "_", num)
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.proc = subprocess.Popen(watch_cmd(num, self.dir), stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.seen = time.monotonic()
+        self.starts = {}            # piece number -> (seconds into the stream it starts at, length)
+        self.origins = {}           # piece number -> clock time the stream started, by that piece
+
+    def running(self):
+        return self.proc.poll() is None
+
+    def stop(self):
+        if self.running():
+            self.proc.kill()
+            self.proc.wait()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def stamped(self, text):
+        """A version's playlist with EXT-X-PROGRAM-DATE-TIME on every piece."""
+        lines, seq, dur, pieces = text.splitlines(), 0, LIVE_SEG, {}
+        for ln in lines:
+            if ln.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                seq = int(ln.split(":")[1])
+            elif ln.startswith("#EXTINF:"):
+                dur = float(ln[8:].split(",")[0])
+            elif ln and not ln.startswith("#"):
+                pieces[ln] = seq
+                if seq not in self.starts:
+                    prev = self.starts.get(seq - 1)
+                    if prev is not None:
+                        self.starts[seq] = prev[0] + prev[1], dur
+                    elif not self.starts:
+                        self.starts[seq] = 0.0, dur
+                if seq in self.starts and seq not in self.origins:
+                    try:   # the full version's piece: both versions are cut at the same frames
+                        mtime = (self.dir / "0" / f"{seq}.ts").stat().st_mtime
+                        self.origins[seq] = mtime - sum(self.starts[seq])
+                    except FileNotFoundError:
+                        pass
+                seq += 1
+        for k in [k for k in self.starts if k < seq - 60]:
+            self.starts.pop(k)
+            self.origins.pop(k, None)
+        recent = [v for k, v in self.origins.items() if k >= seq - 30]
+        if not recent:
+            return text
+        origin, out = min(recent), []
+        for ln in lines:
+            n = pieces.get(ln)
+            if n in self.starts:
+                t = origin + self.starts[n][0]
+                out.append("#EXT-X-PROGRAM-DATE-TIME:" + time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t))
+                           + f".{int(t % 1 * 1000):03d}Z")
+            out.append(ln)
+        return "\n".join(out) + "\n"
+
+
 class LiveTV:
-    """The one live channel being converted."""
+    """The channels being converted. Each holds a tuner, so the single player stops the
+    others when it tunes; the multi-view names the ones it's keeping."""
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.proc, self.num, self.seen = None, None, 0.0
+        self.convs = {}
         threading.Thread(target=self._idle, daemon=True).start()
 
-    def stop(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.kill()
-            self.proc.wait()
-        self.proc = self.num = None
-
-    def playlist(self, num):
-        """The top playlist (listing both versions), once the first pieces are ready."""
+    def playlist(self, num, keep=None):
+        """The top playlist (listing both versions), once the first pieces are ready.
+        keep: the channels to leave running (None: only this one)."""
+        keep = {num} | set(keep or ())
         with self.lock:
-            self.seen = time.monotonic()
-            if self.num != num or self.proc is None or self.proc.poll() is not None:
-                self.stop()
-                shutil.rmtree(LIVE_TMP, ignore_errors=True)
-                LIVE_TMP.mkdir(parents=True, exist_ok=True)
-                self.proc = subprocess.Popen(watch_cmd(num, LIVE_TMP), stdin=subprocess.DEVNULL,
-                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.num = num
+            for other in [k for k in self.convs if k not in keep]:
+                self.convs.pop(other).stop()
+            c = self.convs.get(num)
+            if c is None or not c.running():
+                if c:
+                    c.stop()
+                c = self.convs[num] = Conversion(num)
+            c.seen = time.monotonic()
         deadline = time.monotonic() + 30   # the proxy holds DELAY seconds before sending anything
         while time.monotonic() < deadline:
             try:
-                if (LIVE_TMP / "0" / "index.m3u8").read_text().count("#EXTINF") >= 2:
-                    return (LIVE_TMP / "live.m3u8").read_text()
+                if (c.dir / "0" / "index.m3u8").read_text().count("#EXTINF") >= 2:
+                    return (c.dir / "live.m3u8").read_text()
             except FileNotFoundError:
                 pass
-            if self.proc is None or self.proc.poll() is not None:
+            if not c.running():
                 return None
             time.sleep(0.2)
         return None
 
     def file(self, num, version, name):
-        """A version's playlist or one of its pieces (None when gone or another channel's)."""
-        self.seen = time.monotonic()
-        if num != self.num:
+        """A version's playlist or one of its pieces (None when gone or not running)."""
+        c = self.convs.get(num)
+        if c is None:
             return None
+        c.seen = time.monotonic()
         try:
-            return (LIVE_TMP / version / name).read_bytes()
+            if name.endswith(".m3u8"):
+                return c.stamped((c.dir / version / name).read_text()).encode()
+            return (c.dir / version / name).read_bytes()
         except FileNotFoundError:
             return None
 
@@ -653,8 +721,8 @@ class LiveTV:
         while True:
             time.sleep(5)
             with self.lock:
-                if self.proc and time.monotonic() - self.seen > 20:   # the player went away
-                    self.stop()
+                for num in [k for k, c in self.convs.items() if time.monotonic() - c.seen > 20]:
+                    self.convs.pop(num).stop()   # the player went away
 
 
 LIVE_TV = LiveTV()
@@ -728,6 +796,16 @@ def channels():
         return {"configured": True, "channels": [], "error": str(e)}
 
 
+def proxy_json(path):
+    if not LIVE_URL:
+        return {"configured": False}
+    try:
+        with urllib.request.urlopen(LIVE_URL + path, timeout=3) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # --- live --------------------------------------------------------------------------
 
 def live():
@@ -750,7 +828,7 @@ def live():
 
 # --- web ---------------------------------------------------------------------------
 
-STATIC = {"app.js": "text/javascript", "watch.js": "text/javascript", "hls.min.js": "text/javascript", "style.css": "text/css", "index.html": "text/html; charset=utf-8"}
+STATIC = {"app.js": "text/javascript", "watch.js": "text/javascript", "multi.js": "text/javascript", "hls.min.js": "text/javascript", "style.css": "text/css", "index.html": "text/html; charset=utf-8"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -830,6 +908,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_file(f, "video/mp4") if f.is_file() else self.send(404, {"error": "no such clip"})
         if path == "/api/channels":
             return self.send(200, channels())
+        if path == "/api/breaks":
+            return self.send(200, proxy_json("/breaks"))
         m = re.fullmatch(r"/api/watch/([\w.-]+)/(?:live\.m3u8|([01])/(index\.m3u8|\d+\.ts))", path)
         if m and LIVE_URL:
             num = m.group(1)
@@ -839,7 +919,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(404, {"error": "gone"})
                 kind = "application/vnd.apple.mpegurl" if m.group(3).endswith("m3u8") else "video/mp2t"
                 return self.send(200, body, kind)
-            text = LIVE_TV.playlist(num)
+            keep = [k for k in q.get("keep", "").split(",") if k] if "keep" in q else None
+            text = LIVE_TV.playlist(num, keep)
             if text is None:
                 return self.send(503, {"error": "the channel didn't start (no free tuner?)"})
             return self.send(200, text.encode(), "application/vnd.apple.mpegurl")

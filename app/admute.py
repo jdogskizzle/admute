@@ -15,7 +15,7 @@ import logging
 import os
 import re
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from pathlib import Path
 
 import aiohttp
@@ -35,6 +35,7 @@ LINGER = float(os.environ.get("LINGER", "15"))     # keep a channel open this lo
 DETECT_AFTER = float(os.environ.get("DETECT_AFTER", "3"))  # ignore quick probes
 DETECT_GPU = os.environ.get("DETECT_GPU", "1") == "1"
 DATA = Path(os.environ.get("DATA", "/data"))
+TUNER_COUNT = os.environ.get("TUNER_COUNT", "")     # how many channels can be open at once (else asked of the tuner)
 
 log = logging.getLogger("admute")
 
@@ -203,6 +204,18 @@ class Session:
             q.put_nowait(None)
         log.info("%s %s: closed, tuner released", self.num, self.name)
 
+    def breaks(self):
+        """Recent ad breaks (not sponsor lines), as wall-clock times when viewers reach them,
+        and how far the detector has looked: an unfinished break has lasted at least that long."""
+        det = self.pipe.detector
+        if det is None or det.decider.last_t is None:
+            return [], None
+        shift = time.time() - time.monotonic() + DELAY   # detector time -> when viewers get it
+        known = det.decider.last_t + shift
+        out = [[round(s + shift, 2), None if e == float("inf") else round(e + shift, 2)]
+               for s, e in det.intervals if e == float("inf") or e + shift > known - 900]
+        return out, round(known, 2)
+
     def status(self):
         return {
             "channel": self.num, "name": self.name, "viewers": len(self.clients),
@@ -273,7 +286,41 @@ async def channels(request):
         out.append({"num": c["num"], "name": c["name"], "logo": c["logo"] or (g.icon(c["id"]) if g else ""),
                     "now": cur, "next": nxt, "open": sess is not None,
                     "muted_now": bool(sess and sess.pipe.muting)})
-    return web.json_response({"channels": out, "delay_seconds": DELAY})
+    return web.json_response({"channels": out, "delay_seconds": DELAY,
+                              "tuners": await tuner_count(request.app["http"])})
+
+
+async def breaks(request):
+    """Ad breaks on the open channels, for the studio's multi-view (see Session.breaks)."""
+    out = {}
+    for num, sess in request.app["sessions"].items():
+        b, known = sess.breaks()
+        out[num] = {"breaks": b, "known_until": known}
+    return web.json_response({"channels": out, "now": time.time()})
+
+
+_tuners = {}
+
+
+async def tuner_count(http):
+    """How many channels can be open at once: TUNER_COUNT, or an HDHomeRun's discover.json
+    at the source's address. None when neither says."""
+    if TUNER_COUNT:
+        return int(TUNER_COUNT)
+    if "at" not in _tuners or time.monotonic() - _tuners["at"] > 3600:
+        n = None
+        u = urlsplit(SOURCE)
+        if u.scheme in ("http", "https"):
+            try:
+                async with http.get(f"{u.scheme}://{u.netloc}/discover.json",
+                                    timeout=aiohttp.ClientTimeout(total=5)) as r:
+                    n = int((await r.json(content_type=None)).get("TunerCount") or 0) or None
+            except Exception:
+                pass
+        if n is None and "at" not in _tuners:
+            log.info("couldn't tell how many tuners there are; set TUNER_COUNT for the multi-view")
+        _tuners.update(n=n, at=time.monotonic())
+    return _tuners["n"]
 
 
 async def status(request):
@@ -314,6 +361,7 @@ def main():
     app.router.add_get("/stream/{num}", stream)
     app.router.add_get("/status", status)
     app.router.add_get("/channels", channels)
+    app.router.add_get("/breaks", breaks)
     app.router.add_get("/mute/{num}", mute)
     app.on_startup.append(startup)
     app.on_cleanup.append(cleanup)

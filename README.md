@@ -80,7 +80,7 @@ docker logs -f admute
 (`curl` may not be in the image; use `python3 -c "import urllib.request as u;print(u.urlopen('http://localhost:5004/status').read().decode())"`.)
 
 ## Tuning (environment in docker-compose.yaml)
-`CHANNELS`, `DELAY`, `LINGER`, `LOGO_ON` / `LOGO_OFF` (shape match of a graphic, 0 to 1, above which
+`CHANNELS`, `DELAY`, `LINGER`, `TUNER_COUNT`, `LOGO_ON` / `LOGO_OFF` (shape match of a graphic, 0 to 1, above which
 it counts as on screen / below which it's gone; default 0.35 / 0.3), `GRAPHICS` (how many to follow, default 2), `MERGE` (seconds; ads closer than this count as one break), `AD_MIN`, `SHOW_MIN`,
 `AD_MAX` (unmute if the "ad" lasts this long, e.g. a show with no logo; default 300),
 `SURFACE` (0 turns off the playing-surface check), `SURFACE_AT` (where its threshold sits between
@@ -119,6 +119,17 @@ The `studio` service is a web dashboard for checking and tuning the detector on 
   upscaling is off when it is. CC shows the broadcast's closed captions (drawn by the page,
   above the upscaled picture; c toggles). One channel at a time; it stops 20 seconds after the player goes away, freeing the tuner. Keys:
   space, m, f, ↑/↓ for channels.
+- **Multi-view**: one channel per tuner at once (`TUNER_COUNT` on the admute service, or an
+  HDHomeRun's own count when `SOURCE_M3U` points at it). The main channel is big on the left
+  and has the sound. When it goes to a commercial break of 15 seconds or more (not sponsor
+  lines or short mutes), the sound and the big spot move to a side channel that isn't in a
+  break; they go back to the main channel as soon as its break ends, whatever the side
+  channel is doing. Side channels in a break are hidden (still loading, so they come back at
+  once). Click a side channel to make it the main one. Breaks come from the proxy's `/breaks`
+  (clock times when viewers reach them); the studio stamps each piece of the stream with the
+  time the proxy sent it (`EXT-X-PROGRAM-DATE-TIME`, within about half a second), so each
+  tile knows whether it's in a break right now. Opening the single Watch player stops the
+  multi-view's other channels.
 - **Sounds**: what the commentary says and which sounds come back (see Listening below).
   Sponsor reads found in the game, to mark Mute or Keep, and sounds heard more than once with
   a guess at what they are (jingle at a break's edge, network promo that ends breaks, ad,

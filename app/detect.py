@@ -269,6 +269,7 @@ class Decider:
         # Not armed until the logo has actually been seen, so a show without it isn't muted.
         self.state, self.armed = "show", False
         self.intervals = []  # [start, end] mute ranges, in stream arrival time
+        self.last_t = None   # the latest moment decided on
         self.ads = 0
         self.blacks = deque(maxlen=300)
         self.silences = deque(maxlen=600)
